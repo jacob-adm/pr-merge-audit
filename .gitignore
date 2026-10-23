@@ -1,0 +1,7 @@
+work/
+snapshots/*.bundle
+__pycache__/
+*.pyc
+build.log
+results/
+reports/
