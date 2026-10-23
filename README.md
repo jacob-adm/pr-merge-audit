@@ -114,6 +114,19 @@ the number of follow-up runs, depends on the PRs.
 | `no_tests_ok` | PRs tried even though they change no tests |
 | `probes` | `{name, file, targets}`; targets are `"base"` or PR numbers |
 
+## Tests
+
+```
+python3 -m unittest discover -s tests
+```
+
+`tests/test_audit.py` builds small git repositories in temporary directories and runs the real
+tool on them (no mocks): merge, conflict and swap, a cross-PR test failure found by bisection, a
+PR that fails on the base alone, the not-tried reasons, probes, run counts, determinism across
+two builds, test isolation from `.git`, archive and probe containment, report escaping, output
+capping, the work-directory marker and token handling on redirects. It also checks the golden
+report. The suite takes a few seconds.
+
 ## Self-check
 
 `tests/golden/` holds the snapshot, results and report of a real run (open PRs as of

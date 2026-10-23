@@ -287,6 +287,7 @@ class Workspace:
                 if safe_member(root, m):
                     kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
                     tar.extract(m, root, **kw)
+        proc.stdout.close()
         if proc.wait():
             raise RuntimeError(f"git archive {commit} failed")
         return scratch, root
