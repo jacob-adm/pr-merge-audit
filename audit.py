@@ -21,7 +21,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
+import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -45,6 +49,10 @@ TEST_ENV = {
 }
 LINK_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)", re.I)
 FAIL_RE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(", re.M)
+MARKER = ".audit-workspace"
+OUTPUT_CAP = 4 * 1024 * 1024
+PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
 
 
 def load_config(path):
@@ -52,6 +60,7 @@ def load_config(path):
     cfg.setdefault("python", sys.executable)
     cfg.setdefault("test_cmd", ["{python}", "-m", "unittest", "discover", "-s", "tests"])
     cfg.setdefault("test_prefix", "tests/")
+    cfg.setdefault("test_files", "^" + re.escape(cfg["test_prefix"]))
     cfg.setdefault("test_timeout", 1800)
     cfg.setdefault("workers", 4)
     cfg.setdefault("order", [])
@@ -63,9 +72,15 @@ def load_config(path):
     return cfg
 
 
-def git(repo, *args, check=True):
-    env = dict(os.environ, **GIT_ENV)
-    r = subprocess.run(["git", *args], cwd=repo, env=env, capture_output=True, text=True)
+def base_env():
+    """Only the variables a subprocess needs, so the caller's GIT_*, tokens and the like stay out."""
+    return {k: os.environ[k] for k in PASS_ENV if k in os.environ}
+
+
+def git(repo, *args, check=True, binary=False):
+    env = dict(base_env(), **GIT_ENV)
+    argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", *args]
+    r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=not binary)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
     return r
@@ -79,7 +94,8 @@ def api(cfg, path):
     req.add_header("Accept", "application/vnd.github+json")
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
-        req.add_header("Authorization", "Bearer " + token)
+        # Unredirected, so the token is never sent on to another host.
+        req.add_unredirected_header("Authorization", "Bearer " + token)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode())
 
@@ -92,7 +108,7 @@ def required_status(cfg, sha):
     for s in combined.get("statuses", []):
         if s["context"] == name:
             return s["state"].upper()
-    runs = api(cfg, f"/repos/{cfg['repo']}/commits/{sha}/check-runs?check_name={name}")
+    runs = api(cfg, f"/repos/{cfg['repo']}/commits/{sha}/check-runs?check_name={urllib.parse.quote(name, safe='')}")
     for run in runs.get("check_runs", []):
         return (run.get("conclusion") or run.get("status") or "").upper()
     return "MISSING"
@@ -114,7 +130,8 @@ def cmd_snapshot(cfg, args):
         cache.parent.mkdir(parents=True, exist_ok=True)
         git(".", "init", "-q", "--bare", str(cache))
     stale = git(cache, "for-each-ref", "--format=delete %(refname)", "refs/audit").stdout
-    subprocess.run(["git", "update-ref", "--stdin"], cwd=cache, input=stale, text=True, check=True)
+    subprocess.run(["git", "update-ref", "--stdin"], cwd=cache, input=stale, text=True, check=True,
+                   env=dict(base_env(), **GIT_ENV))
     specs = [f"+refs/heads/{cfg['base']}:refs/audit/base"]
     specs += [f"+refs/pull/{p['number']}/head:refs/audit/pr/{p['number']}" for p in pulls]
     git(cache, "fetch", "-q", "--no-tags", cfg["remote"], *specs)
@@ -123,7 +140,7 @@ def cmd_snapshot(cfg, args):
     for p in sorted(pulls, key=lambda p: p["number"]):
         n = p["number"]
         head = git(cache, "rev-parse", f"refs/audit/pr/{n}").stdout.strip()
-        files = git(cache, "diff", "--name-only", f"{base_sha}...{head}").stdout.split()
+        files = names(git(cache, "diff", "--name-only", "-z", f"{base_sha}...{head}").stdout)
         prs.append({
             "number": n,
             "title": p["title"],
@@ -142,15 +159,48 @@ def cmd_snapshot(cfg, args):
 # ---------------------------------------------------------------- build
 
 
+def names(z):
+    return [x for x in z.split("\0") if x]
+
+
+def safe_member(root, m):
+    """Whether a tar member from `git archive` can be written under `root` without escaping it."""
+    parts = Path(m.name).parts
+    if os.path.isabs(m.name) or ".." in parts or not (m.isfile() or m.isdir() or m.issym()):
+        return False
+    if m.issym():
+        target = os.path.normpath(os.path.join(os.path.dirname(m.name), m.linkname))
+        if os.path.isabs(m.linkname) or target == ".." or target.startswith(".." + os.sep):
+            return False
+    parent = root
+    for part in parts[:-1]:
+        parent = parent / part
+        if parent.is_symlink():
+            return False
+    return True
+
+
+def read_capped(path):
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        if size <= OUTPUT_CAP:
+            data = f.read()
+        else:
+            data = f.read(OUTPUT_CAP // 2)
+            f.seek(size - OUTPUT_CAP // 2)
+            data += b"\n[output truncated]\n" + f.read()
+    return data.decode("utf-8", "replace")
+
+
 def classify(cfg, snap):
     """Split the snapshot into PRs to merge (in order) and PRs not tried, with the reason."""
     eligible, not_tried = [], []
     for p in snap["prs"]:
         n = p["number"]
-        has_tests = any(f.startswith(cfg["test_prefix"]) for f in p["files"])
+        has_tests = any(re.search(cfg["test_files"], f) for f in p["files"])
         if n in cfg["exclude"]:
             reason, detail = "excluded", cfg["exclude"][n]
-        elif p["status"] != "SUCCESS":
+        elif cfg.get("required_status") and p["status"] != "SUCCESS":
             reason, detail = "status", p["status"].lower()
         elif p["draft"]:
             reason, detail = "draft", ""
@@ -175,11 +225,14 @@ class Workspace:
         self.work = Path(work).resolve()
         self.repo = self.work / "repo"
         self.lock = threading.Lock()
-        if self.work.exists():
-            if any(self.work.iterdir()) and not self.repo.exists():
-                sys.exit(f"refusing to clear {self.work}: not a previous build directory")
+        self.local = threading.local()
+        self.runs = {"sequence": 0, "swap": 0, "culprit": 0, "probe": 0}
+        if self.work.exists() and any(self.work.iterdir()):
+            if not (self.work / MARKER).is_file():
+                sys.exit(f"refusing to clear {self.work}: no {MARKER} marker, so not a build directory")
             shutil.rmtree(self.work)
         self.repo.mkdir(parents=True)
+        (self.work / MARKER).write_text("created by audit.py; deleted and recreated on each build\n")
         git(self.repo, "init", "-q")
         git(self.repo, "fetch", "-q", str(Path(bundle).resolve()), "+refs/audit/*:refs/audit/*")
         self.base = snap["base_sha"]
@@ -201,7 +254,7 @@ class Workspace:
     def merge(self, wt, n):
         r = git(wt, "merge", "-q", "--no-ff", "--no-edit", "-m", f"merge #{n}", self.heads[n], check=False)
         if r.returncode:
-            files = git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            files = names(git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout)
             git(wt, "merge", "--abort", check=False)
             return sorted(files) or ["(merge failed)"]
         return None
@@ -210,16 +263,57 @@ class Workspace:
         r = git(self.repo, "merge-tree", "--write-tree", "--name-only", self.ref(a), self.ref(b), check=False)
         return r.returncode == 1
 
+    def phase(self, name):
+        self.local.phase = name
+
+    def count(self):
+        with self.lock:
+            self.runs[getattr(self.local, "phase", "sequence")] += 1
+
+    def export(self, commit):
+        """Copy of `commit`'s files, without .git, in a fresh temporary directory.
+
+        PR code runs only here, so it cannot reach the shared repository's config, hooks or refs
+        through the working tree.
+        """
+        scratch = Path(tempfile.mkdtemp(prefix="audit-run-"))
+        root = scratch / "src"
+        for d in (root, scratch / "home", scratch / "tmp"):
+            d.mkdir()
+        proc = subprocess.Popen(["git", "-c", "core.hooksPath=" + os.devnull, "archive", "--format=tar", commit],
+                                cwd=self.repo, env=dict(base_env(), **GIT_ENV), stdout=subprocess.PIPE)
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+            for m in tar:
+                if safe_member(root, m):
+                    kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
+                    tar.extract(m, root, **kw)
+        if proc.wait():
+            raise RuntimeError(f"git archive {commit} failed")
+        return scratch, root
+
+    def run_in(self, scratch, root, argv):
+        """Run `argv` in `root` with a private HOME and TMPDIR; output is kept on disk and capped."""
+        env = dict(base_env(), **TEST_ENV)
+        env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"))
+        log = scratch / "output.log"
+        with open(log, "wb") as f:
+            try:
+                rc = subprocess.run(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                    timeout=self.cfg["test_timeout"]).returncode
+            except subprocess.TimeoutExpired:
+                rc = None
+        return rc, read_capped(log)
+
     def test_once(self, wt, argv):
-        git(wt, "clean", "-qfdx")
-        env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT") if k in os.environ}
-        env.update(TEST_ENV)
+        self.count()
+        scratch, root = self.export(git(wt, "rev-parse", "HEAD").stdout.strip())
         try:
-            r = subprocess.run(argv, cwd=wt, env=env, capture_output=True, text=True,
-                               timeout=self.cfg["test_timeout"])
-        except subprocess.TimeoutExpired:
+            rc, out = self.run_in(scratch, root, argv)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if rc is None:
             return {"outcome": "fail", "failures": ["(timeout)"]}
-        out = r.stderr + r.stdout
+        r = subprocess.CompletedProcess(argv, rc)
         res = {"outcome": "pass" if r.returncode == 0 else "fail"}
         if r.returncode:
             res["failures"] = sorted({m.split(".")[-1] for m in FAIL_RE.findall(out)}) or ["(no test summary)"]
@@ -244,6 +338,7 @@ class Workspace:
 
 def run_sequence(ws, seq):
     """Merge `seq` in order onto the base, keeping only PRs that merge and pass the tests."""
+    ws.phase("sequence")
     wt = ws.tree("sequence", ws.base)
     steps, merged, final = [], [], ws.test(wt)
     base_result = final
@@ -275,6 +370,7 @@ def build_from(ws, name, prs):
 
 def find_culprit(ws, n, seq, name):
     """First PR in `seq` whose addition makes PR `n` fail its tests, by bisection."""
+    ws.phase("culprit")
     def fails_with(k):
         wt, used = build_from(ws, f"{name}-{k}", seq[:k])
         try:
@@ -306,6 +402,7 @@ def find_culprit(ws, n, seq, name):
 
 def swap(ws, n, merged, tip):
     """Revert the merged PRs that conflict with `n`, merge `n` and run the tests."""
+    ws.phase("swap")
     blockers = [m["pr"] for m in merged if ws.conflicts(n, m["pr"])]
     res = {"blockers": blockers}
     wt = ws.tree(f"swap-{n}", tip)
@@ -325,24 +422,43 @@ def swap(ws, n, merged, tip):
     return res
 
 
-def run_probe(ws, probe, target):
-    src = ws.cfg["_dir"] / probe["file"]
-    module = "audit_probe_" + Path(probe["file"]).stem
-    wt = ws.tree(f"probe-{Path(probe['file']).stem}-{target}", ws.ref(target))
+def place_probe(root, rel, data):
+    """Write the probe file under `root`, refusing symlinks anywhere on the way and existing files."""
+    path = root
+    for part in Path(rel).parts[:-1]:
+        path = path / part
+        if path.is_symlink():
+            return f"{rel}: a directory on the path is a symlink"
+        path.mkdir(exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        dest = wt / ws.cfg["test_prefix"] / (module + ".py")
-        argv = [ws.cfg["python"], "-m", "unittest", ws.cfg["test_prefix"].strip("/").replace("/", ".") + "." + module]
-        git(wt, "clean", "-qfdx")
-        shutil.copyfile(src, dest)
-        env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT") if k in os.environ}
-        env.update(TEST_ENV)
-        r = subprocess.run(argv, cwd=wt, env=env, capture_output=True, text=True, timeout=ws.cfg["test_timeout"])
-        out = r.stderr + r.stdout
-        msg = re.search(r"^\w*Error: (.+)$", out, re.M)
-        return {"probe": probe["name"], "target": target, "outcome": "pass" if r.returncode == 0 else "fail",
-                "message": msg.group(1).strip() if (r.returncode and msg) else ""}
+        fd = os.open(root / rel, flags, 0o644)
+    except OSError as exc:
+        return f"{rel}: {exc.strerror}"
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return None
+
+
+def run_probe(ws, probe, target):
+    ws.phase("probe")
+    module = "audit_probe_" + Path(probe["file"]).stem
+    rel = Path(ws.cfg["test_prefix"]) / (module + ".py")
+    argv = [ws.cfg["python"], "-m", "unittest", ws.cfg["test_prefix"].strip("/").replace("/", ".") + "." + module]
+    row = {"probe": probe["name"], "target": target}
+    scratch, root = ws.export(ws.ref(target))
+    try:
+        refused = place_probe(root, rel, (ws.cfg["_dir"] / probe["file"]).read_bytes())
+        if refused:
+            return dict(row, outcome="error", message=refused)
+        ws.count()
+        rc, out = ws.run_in(scratch, root, argv)
     finally:
-        ws.drop(wt)
+        shutil.rmtree(scratch, ignore_errors=True)
+    msg = re.search(r"^\w*Error: (.+)$", out, re.M)
+    if rc is None:
+        return dict(row, outcome="fail", message="(timeout)")
+    return dict(row, outcome="pass" if rc == 0 else "fail", message=msg.group(1).strip() if (rc and msg) else "")
 
 
 def tool_versions(cfg):
@@ -355,6 +471,8 @@ def tool_versions(cfg):
 def cmd_build(cfg, args):
     snap = json.loads(Path(args.snapshot).read_text())
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
+    print("note: this runs code from every PR it tries; use a disposable machine without credentials",
+          file=sys.stderr)
     ws = Workspace(cfg, snap, bundle, args.work)
     seq, not_tried = classify(cfg, snap)
     print(f"merging {len(seq)} PRs in order", flush=True)
@@ -398,6 +516,7 @@ def cmd_build(cfg, args):
         "swaps": dict(sorted(swaps.items(), key=lambda kv: seq.index(int(kv[0])))),
         "culprits": dict(sorted(culprits.items(), key=lambda kv: seq.index(int(kv[0])))),
         "probes": probes,
+        "test_runs": dict(ws.runs, workers=cfg["workers"]),
     }
     out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -409,12 +528,20 @@ def cmd_build(cfg, args):
 # ---------------------------------------------------------------- report
 
 
+def clean(text, table=False):
+    """Text from test output, made safe inside a Markdown code span (and a table cell)."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text)).replace("`", "'")
+    if len(text) > 200:
+        text = text[:200] + "..."
+    return text.replace("|", "\\|") if table else text
+
+
 def refs(ns):
     return ", ".join(f"#{n}" for n in ns)
 
 
-def code(names):
-    return ", ".join(f"`{x}`" for x in names)
+def code(names, table=False):
+    return ", ".join(f"`{clean(x, table)}`" for x in names)
 
 
 def render(cfg, res):
@@ -459,7 +586,7 @@ def render(cfg, res):
     merged = res["merged"]
     w(f"### Result: {len(merged)} of {tried} PRs merged together with every test passing")
     w("")
-    w(refs(merged))
+    w(refs(merged) or "(none)")
     w("")
 
     ok_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") == "pass"]
@@ -504,7 +631,7 @@ def render(cfg, res):
         w("| Pair | Result | Failing tests |")
         w("|---|---|---|")
         for a, b, p in pairs:
-            w(f"| #{a} + #{b} | {p['outcome']} | {code(p.get('failures', []))} |")
+            w(f"| #{a} + #{b} | {p['outcome']} | {code(p.get('failures', []), table=True)} |")
         w("")
 
     other = []
@@ -530,7 +657,7 @@ def render(cfg, res):
         w("|---|---|---|---|")
         for p in res["probes"]:
             t = f"`{snap['base_ref']}`" if p["target"] == "base" else f"#{p['target']}"
-            w(f"| {p['probe']} | {t} | {p['outcome']} | {('`' + p['message'] + '`') if p['message'] else ''} |")
+            w(f"| {p['probe']} | {t} | {p['outcome']} | {('`' + clean(p['message'], table=True) + '`') if p['message'] else ''} |")
         w("")
 
     labels = [
@@ -554,6 +681,15 @@ def render(cfg, res):
         else:
             w(f"- **{label}:** {refs(r['pr'] for r in rows)}")
     w("")
+    runs = res.get("test_runs")
+    if runs:
+        total = runs["sequence"] + runs["swap"] + runs["culprit"] + runs["probe"]
+        w(f"**Test-suite runs:** {total} in total: {runs['sequence']} for the sequential build, "
+          f"{runs['swap']} for swap tests, {runs['culprit']} for culprit searches and {runs['probe']} "
+          f"for probes. The sequential build runs one at a time; the rest ran on {runs['workers']} "
+          f"parallel workers. Running time scales with the time one test-suite run takes on the "
+          f"machine used.")
+        w("")
     w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
     return "\n".join(L) + "\n"
 
@@ -581,6 +717,32 @@ def cmd_verify(cfg, args):
     print("PASS: report is stable" + (" and matches the golden copy" if args.golden else ""))
 
 
+def cmd_estimate(cfg, args):
+    """Time one test-suite run here and scale it by the run counts of a reference build."""
+    snap = json.loads(Path(args.snapshot).read_text())
+    ref = json.loads(Path(args.reference).read_text())
+    runs = ref.get("test_runs")
+    if not runs:
+        sys.exit(f"{args.reference} has no test_runs counts; use results from a newer build")
+    bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
+    ws = Workspace(cfg, snap, bundle, args.work)
+    wt = ws.tree("estimate", ws.base)
+    argv = [a.format(python=cfg["python"]) for a in cfg["test_cmd"]]
+    start = time.monotonic()
+    ws.test_once(wt, argv)
+    one = time.monotonic() - start
+    ws.drop(wt)
+    shutil.rmtree(ws.work, ignore_errors=True)
+    scale = len(classify(cfg, snap)[0]) / max(1, len(ref["order"]))
+    seq = runs["sequence"] * scale * one
+    rest = (runs["swap"] + runs["culprit"] + runs["probe"]) * scale * one / max(1, cfg["workers"])
+    print(f"one test-suite run here: {one:.0f} s")
+    print(f"scaled from the reference build ({len(ref['order'])} PRs tried; {scale:.2f}x for this snapshot):")
+    print(f"  sequential build  ~{seq / 60:.0f} min")
+    print(f"  follow-up jobs    ~{rest / 60:.0f} min on {cfg['workers']} workers")
+    print(f"  total             ~{(seq + rest) / 60:.0f} min (merges and bisection rebuilds add some more)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="config.json")
@@ -600,9 +762,14 @@ def main():
     v = sub.add_parser("verify")
     v.add_argument("--results", required=True)
     v.add_argument("--golden")
+    e = sub.add_parser("estimate")
+    e.add_argument("--snapshot", required=True)
+    e.add_argument("--bundle")
+    e.add_argument("--reference", default="tests/golden/results.json")
+    e.add_argument("--work", default="work/estimate")
     args = ap.parse_args()
     cfg = load_config(args.config)
-    {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify}[args.cmd](cfg, args)
+    {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify, "estimate": cmd_estimate}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":

@@ -5,3 +5,6 @@ __pycache__/
 build.log
 results/
 reports/
+*.bundle
+build*.log
+configs/*-override.json
