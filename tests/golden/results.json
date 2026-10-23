@@ -1,0 +1,151 @@
+{
+ "base_tests": {
+  "outcome": "pass",
+  "ran": 1,
+  "skipped": 0
+ },
+ "culprits": {
+  "4": {
+   "culprit": 3,
+   "on_base": "pass",
+   "pair": {
+    "failures": [
+     "test_helper"
+    ],
+    "message": "module 'util' has no attribute 'helper'",
+    "outcome": "fail",
+    "ran": 3,
+    "skipped": 0
+   }
+  },
+  "9": {
+   "on_base": "fail"
+  }
+ },
+ "final_tests": {
+  "outcome": "pass",
+  "ran": 4,
+  "skipped": 0
+ },
+ "merged": [
+  1,
+  3,
+  5
+ ],
+ "not_tried": [
+  {
+   "detail": "excluded for the test",
+   "pr": 6,
+   "reason": "excluded"
+  },
+  {
+   "detail": "failure",
+   "pr": 7,
+   "reason": "status"
+  },
+  {
+   "detail": "",
+   "pr": 8,
+   "reason": "no_tests"
+  }
+ ],
+ "open_prs": 9,
+ "order": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  9
+ ],
+ "probes": [
+  {
+   "message": "",
+   "outcome": "pass",
+   "probe": "helper exists",
+   "target": "base"
+  },
+  {
+   "message": "False is not true",
+   "outcome": "fail",
+   "probe": "helper exists",
+   "target": 3
+  }
+ ],
+ "rules": {
+  "order_listed": 6,
+  "overrides": [],
+  "required_status": "ci",
+  "test_files": "^tests/"
+ },
+ "snapshot": {
+  "base_ref": "main",
+  "base_sha": "0a40f3570a38064f98d562625355f614f0148f59",
+  "date": "test",
+  "repo": "local/test"
+ },
+ "steps": [
+  {
+   "outcome": "merged",
+   "pr": 1
+  },
+  {
+   "files": [
+    "app.py"
+   ],
+   "outcome": "conflict",
+   "pr": 2
+  },
+  {
+   "outcome": "merged",
+   "pr": 3
+  },
+  {
+   "failures": [
+    "test_helper"
+   ],
+   "message": "module 'util' has no attribute 'helper'",
+   "outcome": "fail",
+   "pr": 4,
+   "ran": 4,
+   "skipped": 0
+  },
+  {
+   "outcome": "merged",
+   "pr": 5
+  },
+  {
+   "failures": [
+    "test_add"
+   ],
+   "message": "-1 != 3",
+   "outcome": "fail",
+   "pr": 9,
+   "ran": 5,
+   "skipped": 0
+  }
+ ],
+ "swaps": {
+  "2": {
+   "blockers": [
+    1
+   ],
+   "outcome": "pass",
+   "ran": 4,
+   "skipped": 0
+  }
+ },
+ "test_cmd": "python -m unittest discover -s tests",
+ "test_runs": {
+  "culprit": 8,
+  "probe": 2,
+  "sequence": 8,
+  "swap": 1,
+  "workers": 2
+ },
+ "tools": {
+  "git": "2.50.1",
+  "os": "Darwin",
+  "python": "3.14.8"
+ }
+}

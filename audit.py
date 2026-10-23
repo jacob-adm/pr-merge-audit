@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -48,7 +49,6 @@ TEST_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
 }
 LINK_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)", re.I)
-FAIL_RE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(", re.M)
 MARKER = ".audit-workspace"
 OUTPUT_CAP = 4 * 1024 * 1024
 PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
@@ -57,8 +57,12 @@ PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
+    if not cfg.get("test_cmd"):
+        sys.exit(f"{path}: test_cmd is required")
+    for probe in cfg.get("probes", []):
+        if not probe.get("cmd"):
+            sys.exit(f"{path}: probe {probe.get('name')!r} needs a cmd")
     cfg.setdefault("python", sys.executable)
-    cfg.setdefault("test_cmd", ["{python}", "-m", "unittest", "discover", "-s", "tests"])
     cfg.setdefault("test_prefix", "tests/")
     cfg.setdefault("test_files", "^" + re.escape(cfg["test_prefix"]))
     cfg.setdefault("test_timeout", 1800)
@@ -177,7 +181,47 @@ def safe_member(root, m):
         parent = parent / part
         if parent.is_symlink():
             return False
+    # Never write over an entry already there: on a case-insensitive disk, `t` after a link `T`
+    # would otherwise be written through the link.
+    dest = root / m.name
+    if os.path.lexists(dest) and not (m.isdir() and dest.is_dir() and not dest.is_symlink()):
+        return False
     return True
+
+
+def prune_links(root):
+    """Remove links that resolve outside `root`; the text check alone misses chains through other links."""
+    top = os.path.realpath(root)
+    for d, dirs, files in os.walk(root):
+        for name in dirs + files:
+            p = os.path.join(d, name)
+            if os.path.islink(p):
+                real = os.path.realpath(p)
+                if real != top and not real.startswith(top + os.sep):
+                    os.unlink(p)
+
+
+def scan(cfg, rc, out):
+    """Outcome of a test run from its exit status and the configured output patterns.
+
+    Patterns are optional; without them only the exit status counts. With `count_pattern` set,
+    exit status 0 with no tests counted (an early exit, an empty run) is not a pass.
+    """
+    def first(key):
+        m = re.search(cfg[key], out, re.M) if cfg.get(key) else None
+        return m.group(1).strip() if m else ""
+
+    ran = int(first("count_pattern") or 0)
+    res = {"outcome": "pass" if rc == 0 and (ran or not cfg.get("count_pattern")) else "fail"}
+    if rc:
+        found = re.findall(cfg["failure_pattern"], out, re.M) if cfg.get("failure_pattern") else []
+        res["failures"] = sorted(set(found)) or [f"(exit status {rc})"]
+        res["message"] = first("message_pattern")
+    elif res["outcome"] == "fail":
+        res.update(failures=["(no tests ran)"], message="")
+    res["ran"] = ran
+    res["skipped"] = int(first("skipped_pattern") or 0)
+    return res
 
 
 def read_capped(path):
@@ -234,6 +278,10 @@ class Workspace:
         self.repo.mkdir(parents=True)
         (self.work / MARKER).write_text("created by audit.py; deleted and recreated on each build\n")
         git(self.repo, "init", "-q")
+        # Overrides each commit's own .gitattributes, so a PR cannot drop files from the test copy.
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        (info / "attributes").write_text("* -export-ignore -export-subst\n")
         git(self.repo, "fetch", "-q", str(Path(bundle).resolve()), "+refs/audit/*:refs/audit/*")
         self.base = snap["base_sha"]
         self.heads = {p["number"]: p["head"] for p in snap["prs"]}
@@ -280,16 +328,21 @@ class Workspace:
         root = scratch / "src"
         for d in (root, scratch / "home", scratch / "tmp"):
             d.mkdir()
-        proc = subprocess.Popen(["git", "-c", "core.hooksPath=" + os.devnull, "archive", "--format=tar", commit],
-                                cwd=self.repo, env=dict(base_env(), **GIT_ENV), stdout=subprocess.PIPE)
-        with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
-            for m in tar:
-                if safe_member(root, m):
-                    kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
-                    tar.extract(m, root, **kw)
-        proc.stdout.close()
-        if proc.wait():
-            raise RuntimeError(f"git archive {commit} failed")
+        try:
+            proc = subprocess.Popen(["git", "-c", "core.hooksPath=" + os.devnull, "archive", "--format=tar", commit],
+                                    cwd=self.repo, env=dict(base_env(), **GIT_ENV), stdout=subprocess.PIPE)
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                for m in tar:
+                    if safe_member(root, m):
+                        kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
+                        tar.extract(m, root, **kw)
+            proc.stdout.close()
+            if proc.wait():
+                raise RuntimeError(f"git archive {commit} failed")
+            prune_links(root)
+        except BaseException:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
         return scratch, root
 
     def run_in(self, scratch, root, argv):
@@ -297,12 +350,24 @@ class Workspace:
         env = dict(base_env(), **TEST_ENV)
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"))
         log = scratch / "output.log"
+        posix = hasattr(os, "killpg")
         with open(log, "wb") as f:
+            proc = subprocess.Popen(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                    start_new_session=posix)
             try:
-                rc = subprocess.run(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
-                                    timeout=self.cfg["test_timeout"]).returncode
+                rc = proc.wait(timeout=self.cfg["test_timeout"])
             except subprocess.TimeoutExpired:
                 rc = None
+            finally:
+                # Also stop whatever the tests left running in the background.
+                if posix:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                else:
+                    proc.kill()
+                proc.wait()
         return rc, read_capped(log)
 
     def test_once(self, wt, argv):
@@ -314,17 +379,7 @@ class Workspace:
             shutil.rmtree(scratch, ignore_errors=True)
         if rc is None:
             return {"outcome": "fail", "failures": ["(timeout)"]}
-        r = subprocess.CompletedProcess(argv, rc)
-        res = {"outcome": "pass" if r.returncode == 0 else "fail"}
-        if r.returncode:
-            res["failures"] = sorted({m.split(".")[-1] for m in FAIL_RE.findall(out)}) or ["(no test summary)"]
-            msg = re.search(r"^\w*Error: (.+)$", out, re.M)
-            res["message"] = msg.group(1).strip() if msg else ""
-        ran = re.search(r"^Ran (\d+) test", out, re.M)
-        skipped = re.search(r"skipped=(\d+)", out)
-        res["ran"] = int(ran.group(1)) if ran else 0
-        res["skipped"] = int(skipped.group(1)) if skipped else 0
-        return res
+        return scan(self.cfg, rc, out)
 
     def test(self, wt, argv=None):
         argv = argv or [a.format(python=self.cfg["python"]) for a in self.cfg["test_cmd"]]
@@ -343,6 +398,9 @@ def run_sequence(ws, seq):
     wt = ws.tree("sequence", ws.base)
     steps, merged, final = [], [], ws.test(wt)
     base_result = final
+    if base_result["outcome"] != "pass":
+        ws.drop(wt)
+        return steps, merged, ws.base, base_result, final
     for n in seq:
         files = ws.merge(wt, n)
         if files:
@@ -443,9 +501,9 @@ def place_probe(root, rel, data):
 
 def run_probe(ws, probe, target):
     ws.phase("probe")
-    module = "audit_probe_" + Path(probe["file"]).stem
-    rel = Path(ws.cfg["test_prefix"]) / (module + ".py")
-    argv = [ws.cfg["python"], "-m", "unittest", ws.cfg["test_prefix"].strip("/").replace("/", ".") + "." + module]
+    rel = Path(probe.get("dest") or Path(ws.cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
+    module = str(rel.with_suffix("")).replace(os.sep, ".")
+    argv = [a.format(python=ws.cfg["python"], dest=str(rel), module=module) for a in probe["cmd"]]
     row = {"probe": probe["name"], "target": target}
     scratch, root = ws.export(ws.ref(target))
     try:
@@ -456,10 +514,11 @@ def run_probe(ws, probe, target):
         rc, out = ws.run_in(scratch, root, argv)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    msg = re.search(r"^\w*Error: (.+)$", out, re.M)
     if rc is None:
         return dict(row, outcome="fail", message="(timeout)")
-    return dict(row, outcome="pass" if rc == 0 else "fail", message=msg.group(1).strip() if (rc and msg) else "")
+    res = scan(ws.cfg, rc, out)
+    message = res.get("message") or ("(no tests ran)" if res.get("failures") == ["(no tests ran)"] else "")
+    return dict(row, outcome=res["outcome"], message=message)
 
 
 def tool_versions(cfg):
@@ -474,10 +533,19 @@ def cmd_build(cfg, args):
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     print("note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
+    overrides = []
+    if args.ignore_status and cfg.get("required_status"):
+        overrides.append(f"required status check `{cfg['required_status']}` ignored")
+        cfg = dict(cfg, required_status="")
     ws = Workspace(cfg, snap, bundle, args.work)
     seq, not_tried = classify(cfg, snap)
     print(f"merging {len(seq)} PRs in order", flush=True)
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
+    if base_result["outcome"] != "pass":
+        shutil.rmtree(ws.work, ignore_errors=True)
+        detail = ", ".join(base_result.get("failures", [])) + (": " + base_result["message"] if base_result.get("message") else "")
+        sys.exit(f"tests fail on the base {snap['base_sha'][:7]} before any PR is merged ({detail}); "
+                 f"fix the test environment or test_cmd first")
     held = [s for s in steps if s["outcome"] != "merged"]
     print(f"{len(merged)} merged, {len(held)} held; running follow-ups", flush=True)
     swaps, culprits, probes = {}, {}, []
@@ -508,6 +576,12 @@ def cmd_build(cfg, args):
         "open_prs": len(snap["prs"]),
         "tools": tool_versions(cfg),
         "test_cmd": " ".join(a.replace("{python}", "python") for a in cfg["test_cmd"]),
+        "rules": {
+            "required_status": cfg.get("required_status") or "",
+            "test_files": cfg["test_files"],
+            "order_listed": len(cfg["order"]),
+            "overrides": overrides,
+        },
         "base_tests": base_result,
         "final_tests": final,
         "order": seq,
@@ -557,6 +631,10 @@ def render(cfg, res):
     w = L.append
     w(f"**Merge test of the open PRs against {base}**")
     w("")
+    rules = res.get("rules", {})
+    for o in rules.get("overrides", []):
+        w(f"**Override:** {o}.")
+        w("")
     w("<details>")
     w("<summary><b>Procedure</b></summary>")
     w("")
@@ -575,6 +653,11 @@ def render(cfg, res):
     w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
       "its swap, the merge sequence is bisected to the first merged PR that makes it fail; that pair "
       "is then merged onto the base alone and tested.")
+    if rules:
+        status = f"`{rules['required_status']}` must pass" if rules["required_status"] else "none required"
+        w(f"- **Rules:** status check: {status}; a PR counts as changing tests if a file matches "
+          f"`{clean(rules['test_files'])}`; {rules['order_listed']} PRs have a configured position in the "
+          f"order. Exclusions, duplicates and features are listed under Not tried.")
     w("")
     w(f"The merge order decides which side of each conflict merged first. A different order would "
       f"give a different set.")
@@ -585,16 +668,21 @@ def render(cfg, res):
         w(f"**Warning:** the tests do not pass on the base itself ({code(res['base_tests'].get('failures', []))}).")
         w("")
     merged = res["merged"]
-    w(f"### Result: {len(merged)} of {tried} PRs merged together with every test passing")
-    w("")
-    w(refs(merged) or "(none)")
+    if tried:
+        w(f"### Result: {len(merged)} of {tried} PRs merged together with every test passing")
+        w("")
+        w(refs(merged) or "None of them merged.")
+    else:
+        w("### Result: no PRs were eligible to try")
     w("")
 
     ok_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") == "pass"]
     bad_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") != "pass"]
-    w(f"### Text conflicts; tests pass once swapped in ({len(ok_swaps)})")
-    w("")
     if ok_swaps:
+        w(f"### Text conflicts; tests pass once swapped in ({len(ok_swaps)})")
+        w("")
+        w("Each pair changes the same lines. One may replace the other, or a rebase may combine them.")
+        w("")
         w("| PR | Conflicts with |")
         w("|---|---|")
         for n in ok_swaps:
@@ -602,8 +690,9 @@ def render(cfg, res):
         w("")
 
     pairs = []
-    w(f"### Tests fail even after swapping ({len(bad_swaps)})")
-    w("")
+    if bad_swaps:
+        w(f"### Tests fail even after swapping ({len(bad_swaps)})")
+        w("")
     for n in bad_swaps:
         s = swaps[n]
         out = s.get("outcome")
@@ -618,15 +707,16 @@ def render(cfg, res):
             w(f"  It also fails on `{snap['base_ref']}` alone.")
         if c.get("culprit"):
             pairs.append((c["culprit"], n, c["pair"]))
-    w("")
+    if bad_swaps:
+        w("")
 
     for n in res["order"]:
         c = culprits.get(n)
         if c and c.get("culprit"):
             pairs.append((c["culprit"], n, c["pair"]))
-    w(f"### No text conflict, but a pair fails its tests ({len(pairs)})")
-    w("")
     if pairs:
+        w(f"### No text conflict, but a pair fails its tests ({len(pairs)})")
+        w("")
         w(f"Each pair merged onto `{snap['base_ref']}` alone:")
         w("")
         w("| Pair | Result | Failing tests |")
@@ -669,8 +759,9 @@ def render(cfg, res):
         ("feature", "Feature, left for separate review"),
         ("no_tests", "Changes code without tests"),
     ]
-    w(f"### Not tried ({len(res['not_tried'])} of {res['open_prs']} open PRs)")
-    w("")
+    if res["not_tried"]:
+        w(f"### Not tried ({len(res['not_tried'])} of {res['open_prs']} open PRs)")
+        w("")
     for key, label in labels:
         rows = [r for r in res["not_tried"] if r["reason"] == key]
         if not rows:
@@ -679,9 +770,12 @@ def render(cfg, res):
             w(f"- **{label}:**")
             for r in rows:
                 w(f"  - #{r['pr']}: {r['detail']}")
+        elif key == "status":
+            w(f"- **{label}:** " + ", ".join(f"#{r['pr']} ({r['detail']})" for r in rows))
         else:
             w(f"- **{label}:** {refs(r['pr'] for r in rows)}")
-    w("")
+    if res["not_tried"]:
+        w("")
     runs = res.get("test_runs")
     if runs:
         total = runs["sequence"] + runs["swap"] + runs["culprit"] + runs["probe"]
@@ -757,6 +851,8 @@ def main():
     b.add_argument("--bundle")
     b.add_argument("--work", default="work/build")
     b.add_argument("--out")
+    b.add_argument("--ignore-status", action="store_true",
+                   help="try PRs whatever their required status check says (shown in the report)")
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)
     r.add_argument("--out")
@@ -766,10 +862,11 @@ def main():
     e = sub.add_parser("estimate")
     e.add_argument("--snapshot", required=True)
     e.add_argument("--bundle")
-    e.add_argument("--reference", default="tests/golden/results.json")
+    e.add_argument("--reference", required=True, help="results file of an earlier build")
     e.add_argument("--work", default="work/estimate")
     args = ap.parse_args()
-    cfg = load_config(args.config)
+    # report and verify read only a results file, so they need no project config.
+    cfg = load_config(args.config) if args.cmd in ("snapshot", "build", "estimate") else {}
     {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify, "estimate": cmd_estimate}[args.cmd](cfg, args)
 
 

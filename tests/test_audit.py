@@ -8,7 +8,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import shutil
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -42,6 +44,16 @@ def branch(repo, name, files, remove=()):
     sh(repo, "git", "checkout", "-q", "main")
     return head
 
+
+# How the fixtures' tests are run and read; the tool itself assumes no test runner.
+UNITTEST = {
+    "test_cmd": ["{python}", "-m", "unittest", "discover", "-s", "tests"],
+    "failure_pattern": r"^(?:FAIL|ERROR): (\S+) \(",
+    "count_pattern": r"^Ran (\d+) test",
+    "skipped_pattern": r"skipped=(\d+)",
+    "message_pattern": r"^\w*Error: (.+)$",
+}
+PROBE_CMD = ["{python}", "-m", "unittest", "{module}"]
 
 TEST_ADD = "import unittest, app\nclass T(unittest.TestCase):\n    def test_add(self): self.assertEqual(app.add(1, 2), 3)\n"
 
@@ -96,17 +108,18 @@ def make_project(tmp):
         "import unittest, util\nclass P(unittest.TestCase):\n"
         "    def test_helper_exists(self): self.assertTrue(hasattr(util, 'helper'))\n")
     config = tmp / "config.json"
-    config.write_text(json.dumps({
-        "repo": "local/test", "base": "main", "required_status": "ci", "workers": 2,
-        "order": [1, 2, 3, 4, 5, 9], "exclude": {"6": "excluded for the test"},
-        "probes": [{"name": "helper exists", "file": "probe.py", "targets": ["base", 3]}],
-    }))
+    config.write_text(json.dumps(dict(
+        UNITTEST, repo="local/test", base="main", required_status="ci", workers=2,
+        order=[1, 2, 3, 4, 5, 9], exclude={"6": "excluded for the test"},
+        probes=[{"name": "helper exists", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 3]}],
+    )))
     return audit.load_config(str(config)), snap, bundle
 
 
-def build(cfg, snap, bundle, tmp, name):
+def build(cfg, snap, bundle, tmp, name, ignore_status=False):
     out = tmp / f"{name}.json"
-    args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), work=str(tmp / f"work-{name}"), out=str(out))
+    args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), work=str(tmp / f"work-{name}"), out=str(out),
+                              ignore_status=ignore_status)
     audit.cmd_build(cfg, args)
     return json.loads(out.read_text())
 
@@ -164,6 +177,61 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
 
 
+def small_project(tmp, base_test, status):
+    """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
+    repo = tmp / "src"
+    repo.mkdir()
+    sh(repo, "git", "init", "-q", "-b", "main")
+    base = commit(repo, {"app.py": "X = 1\n", "tests/test_base.py": base_test}, "base")
+    head = branch(repo, "p1", {"tests/test_p1.py": "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"})
+    sh(repo, "git", "update-ref", "refs/audit/base", base)
+    sh(repo, "git", "update-ref", "refs/audit/pr/1", head)
+    bundle = tmp / "snap.bundle"
+    sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+    snap = tmp / "snap.json"
+    snap.write_text(json.dumps({"date": "test", "repo": "local/test", "base_ref": "main", "base_sha": base,
+                                "prs": [{"number": 1, "title": "p1", "head": head, "draft": False, "status": status,
+                                         "linked": [], "files": ["tests/test_p1.py"]}]}))
+    config = tmp / "config.json"
+    config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", required_status="ci", workers=1)))
+    return audit.load_config(str(config)), snap, bundle
+
+
+PASSING = "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n"
+
+
+class SmallBuilds(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_failing_base_stops_the_build(self):
+        failing = "import unittest\nclass T(unittest.TestCase):\n    def test_base(self): self.fail('broken')\n"
+        cfg, snap, bundle = small_project(self.tmp, failing, "SUCCESS")
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("test_base", str(stop.exception.code))
+        self.assertFalse((self.tmp / "a.json").exists())
+        self.assertFalse((self.tmp / "work-a").exists())
+
+    def test_nothing_eligible_renders_compactly(self):
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "FAILURE")
+        text = audit.render(cfg, build(cfg, snap, bundle, self.tmp, "a"))
+        self.assertIn("### Result: no PRs were eligible to try", text)
+        self.assertIn("#1 (failure)", text)
+        self.assertNotIn("(0)", text)
+        self.assertNotIn("\n\n\n", text)
+
+    def test_ignore_status_is_applied_and_shown(self):
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "FAILURE")
+        res = build(cfg, snap, bundle, self.tmp, "a", ignore_status=True)
+        self.assertEqual(res["merged"], [1])
+        self.assertIn("**Override:** required status check `ci` ignored.", audit.render(cfg, res))
+
+
 class Classify(unittest.TestCase):
     def cfg(self, **kw):
         cfg = {"test_prefix": "tests/", "order": [], "exclude": {}, "duplicates": {}, "features": {},
@@ -205,6 +273,17 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("\n", text)
         self.assertNotRegex(text, r"(?<!\\)\|")
         self.assertLessEqual(len(text), 203 + text.count("\\"))
+
+    def test_scan_without_patterns_uses_exit_status(self):
+        self.assertEqual(audit.scan({}, 0, "anything")["outcome"], "pass")
+        res = audit.scan({}, 3, "anything")
+        self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(exit status 3)"]))
+
+    def test_scan_count_pattern_requires_a_test(self):
+        cfg = {"count_pattern": r"^(\d+) passed", "failure_pattern": r"^FAILED (\S+)"}
+        self.assertEqual(audit.scan(cfg, 0, "4 passed")["outcome"], "pass")
+        self.assertEqual(audit.scan(cfg, 0, "0 passed")["failures"], ["(no tests ran)"])
+        self.assertEqual(audit.scan(cfg, 1, "FAILED a::b\nFAILED a::c\n")["failures"], ["a::b", "a::c"])
 
     def test_read_capped(self):
         with tempfile.TemporaryDirectory() as d:
@@ -277,6 +356,105 @@ class Containment(unittest.TestCase):
         self.assertTrue((work / "keep.txt").exists())
 
 
+def git_in(repo, *argv, data=None):
+    env = dict(os.environ, **audit.GIT_ENV)
+    return subprocess.run(["git", *argv], cwd=repo, env=env, input=data, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def mktree(repo, entries):
+    """Tree from (mode, name, blob text or subtree id) rows, so a test can hold any names and links."""
+    rows = []
+    for mode, name, value in entries:
+        kind = "tree" if mode == "040000" else "blob"
+        oid = value if kind == "tree" else git_in(repo, "hash-object", "-w", "--stdin", data=value)
+        rows.append(f"{mode} {kind} {oid}\t{name}\n")
+    return git_in(repo, "mktree", data="".join(rows))
+
+
+class HostileTrees(unittest.TestCase):
+    """Commits a PR author could push, run through the real export and test steps."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name).resolve()
+        self.src = self.tmp / "src"
+        self.src.mkdir()
+        git_in(self.src, "init", "-q")
+        self.victim = self.tmp / "victim.txt"
+        self.victim.write_text("keep")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def workspace(self, tree):
+        head = git_in(self.src, "commit-tree", tree, "-m", "pr")
+        git_in(self.src, "update-ref", "refs/audit/base", head)
+        bundle = self.tmp / "b.bundle"
+        git_in(self.src, "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        cfg = dict(UNITTEST, test_timeout=60, python=sys.executable)
+        return audit.Workspace(cfg, {"base_sha": head, "prs": []}, bundle, self.tmp / "work"), head
+
+    def pr_tree(self, files):
+        return mktree(self.src, [("040000", "tests", mktree(self.src, [("100644", k, v) for k, v in files.items()]))])
+
+    def test_chained_link_is_pruned_and_never_written_through(self):
+        # sub/s points at the copy's root, so the text of T cancels out while on disk it climbs to /.
+        up = "/".join(["sub/s"] * 20 + [".."] * 40)
+        sub = mktree(self.src, [("120000", "s", "..")])
+        tree = mktree(self.src, [("120000", "T", up + str(self.victim)), ("040000", "sub", sub),
+                                 ("100644", "t", "overwritten\n")])
+        ws, head = self.workspace(tree)
+        scratch, root = ws.export(head)
+        try:
+            self.assertEqual(self.victim.read_text(), "keep")
+            self.assertFalse(os.path.lexists(root / "T") and os.path.realpath(root / "T") == str(self.victim))
+            for d, dirs, files in os.walk(root):
+                for name in dirs + files:
+                    real = os.path.realpath(os.path.join(d, name))
+                    self.assertTrue(real.startswith(os.path.realpath(root)), real)
+        finally:
+            shutil.rmtree(scratch)
+
+    def test_export_ignore_cannot_hide_files(self):
+        tree = mktree(self.src, [("100644", ".gitattributes", "tests/test_hidden.py export-ignore\n"),
+                                 ("040000", "tests", mktree(self.src, [("100644", "test_hidden.py", PASSING)]))])
+        ws, head = self.workspace(tree)
+        scratch, root = ws.export(head)
+        try:
+            self.assertTrue((root / "tests" / "test_hidden.py").is_file())
+        finally:
+            shutil.rmtree(scratch)
+
+    def test_early_exit_is_not_a_pass(self):
+        ws, head = self.workspace(self.pr_tree({"test_x.py": "import os\nos._exit(0)\n"}))
+        wt = ws.tree("t", head)
+        res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(no tests ran)"]))
+
+    def test_background_processes_are_stopped(self):
+        pidfile = self.tmp / "pid"
+        start = ("import subprocess, sys, unittest\n"
+                 "class T(unittest.TestCase):\n"
+                 "    def test_spawn(self):\n"
+                 "        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+                 f"        open({str(pidfile)!r}, 'w').write(str(p.pid))\n")
+        ws, head = self.workspace(self.pr_tree({"test_spawn.py": start}))
+        wt = ws.tree("t", head)
+        self.assertEqual(ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])["outcome"],
+                         "pass")
+        pid = int(pidfile.read_text())
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, 9)
+            self.fail("background process outlived the test run")
+
+
 class TokenRedirect(unittest.TestCase):
     def test_token_not_sent_to_redirect_target(self):
         seen = {}
@@ -318,10 +496,11 @@ class TokenRedirect(unittest.TestCase):
 
 
 class Golden(unittest.TestCase):
+    """Results of a build of the fixture in make_project, and the report they render to."""
+
     def test_golden_report(self):
-        cfg = audit.load_config(str(ROOT / "config.json"))
         res = json.loads((GOLDEN / "results.json").read_text())
-        self.assertEqual(audit.render(cfg, res), (GOLDEN / "report.md").read_text())
+        self.assertEqual(audit.render({}, res), (GOLDEN / "report.md").read_text())
 
 
 if __name__ == "__main__":

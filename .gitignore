@@ -7,4 +7,3 @@ results/
 reports/
 *.bundle
 build*.log
-configs/*-override.json

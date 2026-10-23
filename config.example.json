@@ -1,0 +1,20 @@
+{
+ "repo": "OWNER/NAME",
+ "remote": "https://github.com/OWNER/NAME.git",
+ "api": "https://api.github.com",
+ "base": "main",
+ "required_status": "",
+ "test_cmd": ["{python}", "-m", "unittest", "discover", "-s", "tests"],
+ "test_prefix": "tests/",
+ "failure_pattern": "^(?:FAIL|ERROR): (\\S+) \\(",
+ "count_pattern": "^Ran (\\d+) test",
+ "skipped_pattern": "skipped=(\\d+)",
+ "message_pattern": "^\\w*Error: (.+)$",
+ "workers": 4,
+ "order": [],
+ "exclude": {},
+ "duplicates": {},
+ "features": {},
+ "no_tests_ok": [],
+ "probes": []
+}
