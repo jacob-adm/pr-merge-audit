@@ -85,6 +85,16 @@ def load_config(path):
     return cfg
 
 
+def fill(args, **values):
+    """Replace `{name}` placeholders by plain substitution, so other braces in arguments are left alone."""
+    out = []
+    for a in args:
+        for k, v in values.items():
+            a = a.replace("{" + k + "}", str(v))
+        out.append(a)
+    return out
+
+
 def base_env():
     """Only the variables a subprocess needs, so the caller's GIT_*, tokens and the like stay out."""
     return {k: os.environ[k] for k in PASS_ENV if k in os.environ}
@@ -248,16 +258,20 @@ def scan(cfg, rc, out):
         m = re.search(cfg[key], out, re.M) if cfg.get(key) else None
         return m.group(1).strip() if m else ""
 
-    ran = int(first("count_pattern") or 0)
+    def number(key):
+        m = re.search(r"\d+", first(key))
+        return int(m.group()) if m else 0
+
+    ran = number("count_pattern")
     res = {"outcome": "pass" if rc == 0 and (ran or not cfg.get("count_pattern")) else "fail"}
     if rc:
-        found = re.findall(cfg["failure_pattern"], out, re.M) if cfg.get("failure_pattern") else []
+        found = [m.group(1) for m in re.finditer(cfg["failure_pattern"], out, re.M)] if cfg.get("failure_pattern") else []
         res["failures"] = sorted(set(found)) or [f"(exit status {rc})"]
         res["message"] = first("message_pattern")
     elif res["outcome"] == "fail":
         res.update(failures=["(no tests ran)"], message="")
     res["ran"] = ran
-    res["skipped"] = int(first("skipped_pattern") or 0)
+    res["skipped"] = number("skipped_pattern")
     return res
 
 
@@ -446,7 +460,7 @@ class Workspace:
         """
         setup = self.cfg.get("setup_cmd")
         if setup:
-            rc, out = self.run_in(scratch, root, [a.format(python=self.cfg["python"]) for a in setup])
+            rc, out = self.run_in(scratch, root, fill(setup, python=self.cfg["python"]))
             if rc != 0:
                 return rc, out, True
         rc, out = self.run_in(scratch, root, argv)
@@ -466,7 +480,7 @@ class Workspace:
         return scan(self.cfg, rc, out)
 
     def test(self, wt, argv=None):
-        argv = argv or [a.format(python=self.cfg["python"]) for a in self.cfg["test_cmd"]]
+        argv = argv or fill(self.cfg["test_cmd"], python=self.cfg["python"])
         first = self.test_once(wt, argv)
         if first["outcome"] == "pass":
             return first
@@ -482,7 +496,7 @@ def run_sequence(ws, seq):
     wt = ws.tree("sequence", ws.base)
     steps, merged, final = [], [], ws.test(wt)
     base_result = final
-    if base_result["outcome"] != "pass":
+    if base_result["outcome"] not in ("pass", "flaky"):
         ws.drop(wt)
         return steps, merged, ws.base, base_result, final
     for n in seq:
@@ -518,12 +532,15 @@ def find_culprit(ws, n, seq, name):
         wt, used = build_from(ws, f"{name}-{k}", seq[:k])
         try:
             if ws.merge(wt, n):
-                return True
-            return ws.test(wt)["outcome"] != "pass"
+                return "conflict"
+            return ws.test(wt)["outcome"] not in ("pass", "flaky")
         finally:
             ws.drop(wt)
 
-    if fails_with(0):
+    on_base = fails_with(0)
+    if on_base == "conflict":
+        return {"on_base": "conflict"}
+    if on_base:
         return {"on_base": "fail"}
     lo, hi = 0, len(seq)
     if not fails_with(hi):
@@ -559,7 +576,7 @@ def swap(ws, n, merged, tip):
         res.update(ws.test(wt))
     finally:
         ws.drop(wt)
-    if res["outcome"] != "pass":
+    if res["outcome"] not in ("pass", "flaky"):
         rest = [m["pr"] for m in merged if m["pr"] not in blockers]
         res["culprit"] = find_culprit(ws, n, rest, f"cul-swap-{n}")
     return res
@@ -587,7 +604,7 @@ def run_probe(ws, probe, target):
     ws.phase("probe")
     rel = Path(probe.get("dest") or Path(ws.cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
     module = str(rel.with_suffix("")).replace(os.sep, ".")
-    argv = [a.format(python=ws.cfg["python"], dest=str(rel), module=module) for a in probe["cmd"]]
+    argv = fill(probe["cmd"], python=ws.cfg["python"], dest=rel, module=module)
     row = {"probe": probe["name"], "target": target}
     scratch, root = ws.export(ws.ref(target))
     try:
@@ -608,10 +625,13 @@ def run_probe(ws, probe, target):
 
 
 def tool_versions(cfg):
-    py = subprocess.run([cfg["python"], "-c", "import platform;print(platform.python_version())"],
-                        capture_output=True, text=True).stdout.strip()
     gv = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip().split()[2]
-    return {"python": py, "git": gv, "os": platform.system()}
+    tools = {"git": gv, "os": platform.system()}
+    cmds = [cfg["test_cmd"], cfg.get("setup_cmd") or []] + [p["cmd"] for p in cfg["probes"]]
+    if any("{python}" in a for cmd in cmds for a in cmd):
+        tools["python"] = subprocess.run([cfg["python"], "-c", "import platform;print(platform.python_version())"],
+                                         capture_output=True, text=True).stdout.strip()
+    return tools
 
 
 def cmd_build(cfg, args):
@@ -636,7 +656,7 @@ def cmd_build(cfg, args):
     seq, not_tried = classify(cfg, snap)
     print(f"merging {len(seq)} PRs in order", flush=True)
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
-    if base_result["outcome"] != "pass":
+    if base_result["outcome"] not in ("pass", "flaky"):
         shutil.rmtree(ws.work, ignore_errors=True)
         detail = ", ".join(base_result.get("failures", [])) + (": " + base_result["message"] if base_result.get("message") else "")
         sys.exit(f"tests fail on the base {snap['base_sha'][:7]} before any PR is merged ({detail}); "
@@ -650,7 +670,7 @@ def cmd_build(cfg, args):
             n = s["pr"]
             if s["outcome"] == "conflict":
                 jobs[pool.submit(swap, ws, n, merged, tip)] = ("swap", n)
-            else:
+            elif s["outcome"] != "flaky":  # it passed on re-run, so there is no failure to trace
                 merged_before = [m["pr"] for m in merged if seq.index(m["pr"]) < seq.index(n)]
                 jobs[pool.submit(find_culprit, ws, n, merged_before, f"cul-{n}")] = ("culprit", n)
         for probe in cfg["probes"]:
@@ -734,7 +754,8 @@ def render(cfg, res):
     w("<summary><b>Procedure</b></summary>")
     w("")
     w(f"- **Base:** `{snap['base_ref']}` at `{snap['base_sha'][:7]}`, with PR heads fetched on {snap['date']}.")
-    w(f"- **Environment:** Python {tools['python']}, git {tools['git']}, {tools['os']}.")
+    py = f"Python {tools['python']}, " if tools.get("python") else ""
+    w(f"- **Environment:** {py}git {tools['git']}, {tools['os']}.")
     skipped = res["final_tests"].get("skipped", 0)
     note = f" {skipped} tests were skipped in the final run." if skipped else ""
     w(f"- **Test run:** `{res['test_cmd']}` after every merge.{note}")
@@ -759,7 +780,10 @@ def render(cfg, res):
     w("")
     w("</details>")
     w("")
-    if res["base_tests"]["outcome"] != "pass":
+    if res["base_tests"]["outcome"] == "flaky":
+        w("**Warning:** the tests on the base are flaky (failed, then passed on re-run).")
+        w("")
+    elif res["base_tests"]["outcome"] != "pass":
         w(f"**Warning:** the tests do not pass on the base itself ({code(res['base_tests'].get('failures', []))}).")
         w("")
     merged = res["merged"]
@@ -793,13 +817,16 @@ def render(cfg, res):
         out = s.get("outcome")
         if out in ("conflict", "revert_conflict"):
             what = "still conflicts after the swap" if out == "conflict" else "a blocking PR could not be reverted"
-            w(f"- **#{n}:** conflicts with {refs(s['blockers'])}; {what}.")
+            w(f"- **#{n}:** conflicts with {refs(s['blockers']) or 'the combined build only'}; {what}.")
             continue
         verb = "is flaky on" if out == "flaky" else "fails"
-        w(f"- **#{n}:** with {refs(s['blockers'])} reverted, {verb} {code(s.get('failures', []))}.")
+        reverted = f"with {refs(s['blockers'])} reverted" if s["blockers"] else "with nothing to revert"
+        w(f"- **#{n}:** {reverted}, {verb} {code(s.get('failures', []))}.")
         c = s.get("culprit", {})
         if c.get("on_base") == "fail":
             w(f"  It also fails on `{snap['base_ref']}` alone.")
+        elif c.get("on_base") == "conflict":
+            w(f"  It does not merge onto `{snap['base_ref']}` alone.")
         if c.get("culprit"):
             pairs.append((c["culprit"], n, c["pair"]))
     if bad_swaps:
@@ -826,6 +853,8 @@ def render(cfg, res):
         c = culprits.get(n, {})
         if c.get("on_base") == "fail":
             other.append(f"- **Fails its own tests on `{snap['base_ref']}`:** #{n} ({code(st.get('failures', []))}).")
+        elif c.get("on_base") == "conflict":
+            other.append(f"- **Fails in the build and does not merge onto `{snap['base_ref']}` alone:** #{n} ({code(st.get('failures', []))}).")
         elif c and not c.get("culprit"):
             other.append(f"- **Fails only in the full build, no single culprit found:** #{n} ({code(st.get('failures', []))}).")
         if st.get("outcome") == "flaky":
@@ -918,7 +947,7 @@ def cmd_estimate(cfg, args):
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     ws = Workspace(cfg, snap, bundle, args.work)
     wt = ws.tree("estimate", ws.base)
-    argv = [a.format(python=cfg["python"]) for a in cfg["test_cmd"]]
+    argv = fill(cfg["test_cmd"], python=cfg["python"])
     start = time.monotonic()
     ws.test_once(wt, argv)
     one = time.monotonic() - start
