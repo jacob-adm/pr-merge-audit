@@ -50,6 +50,7 @@ TEST_ENV = {
 }
 LINK_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)", re.I)
 MARKER = ".audit-workspace"
+MIN_GIT = (2, 38)
 OUTPUT_CAP = 4 * 1024 * 1024
 PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
@@ -98,6 +99,33 @@ def git(repo, *args, check=True, binary=False):
     return r
 
 
+def git_version(text):
+    """(major, minor) from `git --version` output, (0, 0) if it has none."""
+    m = re.search(r"(\d+)\.(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def check_git():
+    try:
+        found = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        found = ""
+    if git_version(found) < MIN_GIT:
+        sys.exit(f"git {MIN_GIT[0]}.{MIN_GIT[1]} or later is needed (for `git merge-tree --write-tree`); "
+                 f"found: {found or 'no git on PATH'}")
+
+
+def check_probes(cfg, snap):
+    """Stop before any test runs if a probe names a missing file or a target not in the snapshot."""
+    numbers = {p["number"] for p in snap["prs"]}
+    for probe in cfg["probes"]:
+        if not (cfg["_dir"] / probe["file"]).is_file():
+            sys.exit(f"probe {probe['name']!r}: file {probe['file']} not found next to the config")
+        for target in probe.get("targets", []):
+            if target != "base" and target not in numbers:
+                sys.exit(f"probe {probe['name']!r}: target {target!r} is neither \"base\" nor an open PR in the snapshot")
+
+
 # ---------------------------------------------------------------- snapshot
 
 
@@ -127,6 +155,7 @@ def required_status(cfg, sha):
 
 
 def cmd_snapshot(cfg, args):
+    check_git()
     date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -325,7 +354,25 @@ class Workspace:
 
     def conflicts(self, a, b):
         r = git(self.repo, "merge-tree", "--write-tree", "--name-only", self.ref(a), self.ref(b), check=False)
+        # A result (clean or conflicted) starts with the merged tree's id; anything else is an error,
+        # including exit 1 for an unmergeable ref and 129 from a git without --write-tree.
+        if r.returncode not in (0, 1) or not re.match(r"[0-9a-f]{40,64}$", r.stdout.split("\n", 1)[0]):
+            raise RuntimeError(f"git merge-tree {a} {b} failed: {r.stderr.strip()}")
         return r.returncode == 1
+
+    def incomplete_checkout(self, commit):
+        """What test runs of `commit` would lack: `git archive` leaves out submodules, and LFS files stay pointers."""
+        missing = []
+        rows = [r for r in git(self.repo, "ls-tree", "-r", "-z", commit).stdout.split("\0") if r]
+        if any(r.startswith("160000 ") for r in rows):
+            missing.append("submodules")
+        for r in rows:
+            meta, _, path = r.partition("\t")
+            if path.rsplit("/", 1)[-1] == ".gitattributes" and meta.split()[1] == "blob":
+                if re.search(r"\bfilter=lfs\b", git(self.repo, "cat-file", "blob", meta.split()[2]).stdout):
+                    missing.append("Git LFS files")
+                    break
+        return missing
 
     def phase(self, name):
         self.local.phase = name
@@ -568,7 +615,9 @@ def tool_versions(cfg):
 
 
 def cmd_build(cfg, args):
+    check_git()
     snap = json.loads(Path(args.snapshot).read_text())
+    check_probes(cfg, snap)
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     print("note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
@@ -577,6 +626,13 @@ def cmd_build(cfg, args):
         overrides.append(f"required status check `{cfg['required_status']}` ignored")
         cfg = dict(cfg, required_status="")
     ws = Workspace(cfg, snap, bundle, args.work)
+    missing = " and ".join(ws.incomplete_checkout(ws.base))
+    if missing and not cfg.get("allow_incomplete_checkout"):
+        shutil.rmtree(ws.work, ignore_errors=True)
+        sys.exit(f"the base {snap['base_sha'][:7]} uses {missing}, which test runs would not contain; "
+                 f"set allow_incomplete_checkout to run anyway")
+    if missing:
+        overrides.append(f"test runs lack {missing} (allow_incomplete_checkout)")
     seq, not_tried = classify(cfg, snap)
     print(f"merging {len(seq)} PRs in order", flush=True)
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
@@ -858,6 +914,7 @@ def cmd_estimate(cfg, args):
     runs = ref.get("test_runs")
     if not runs:
         sys.exit(f"{args.reference} has no test_runs counts; use results from a newer build")
+    check_git()
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     ws = Workspace(cfg, snap, bundle, args.work)
     wt = ws.tree("estimate", ws.base)
