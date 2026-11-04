@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -102,7 +103,8 @@ def base_env():
 
 def git(repo, *args, check=True, binary=False):
     env = dict(base_env(), **GIT_ENV)
-    argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", *args]
+    # gc.auto=0: parallel jobs merge in worktrees of one repository; a background gc must not race them.
+    argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "gc.auto=0", *args]
     r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=not binary)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
@@ -146,8 +148,22 @@ def api(cfg, path):
     if token:
         # Unredirected, so the token is never sent on to another host.
         req.add_unredirected_header("Authorization", "Bearer " + token)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        hint = ""
+        if exc.code == 429 or (exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"):
+            hint = "; API rate limit reached"
+            reset = exc.headers.get("X-RateLimit-Reset", "")
+            if reset.isdigit():
+                at = datetime.datetime.fromtimestamp(int(reset), datetime.timezone.utc)
+                hint += f" (resets {at:%Y-%m-%d %H:%M} UTC)"
+            if not token:
+                hint += "; set GITHUB_TOKEN for a higher limit"
+        sys.exit(f"{req.full_url}: HTTP {exc.code} {exc.reason}{hint}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"{req.full_url}: {exc.reason}")
 
 
 def required_status(cfg, sha):
@@ -675,15 +691,22 @@ def cmd_build(cfg, args):
                 jobs[pool.submit(find_culprit, ws, n, merged_before, f"cul-{n}")] = ("culprit", n)
         for probe in cfg["probes"]:
             for target in probe["targets"]:
-                jobs[pool.submit(run_probe, ws, probe, target)] = ("probe", None)
+                jobs[pool.submit(run_probe, ws, probe, target)] = ("probe", (probe["name"], target))
         for fut in concurrent.futures.as_completed(jobs):
             kind, n = jobs[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:  # one broken job must not discard hours of other results
+                error = f"{type(exc).__name__}: {exc}"
+                result = {"swap": {"blockers": [], "outcome": "error", "message": error},
+                          "culprit": {"error": error},
+                          "probe": {"probe": n[0], "target": n[1], "outcome": "error", "message": error}}[kind]
             if kind == "swap":
-                swaps[str(n)] = fut.result()
+                swaps[str(n)] = result
             elif kind == "culprit":
-                culprits[str(n)] = fut.result()
+                culprits[str(n)] = result
             else:
-                probes.append(fut.result())
+                probes.append(result)
     order = {(p["name"], str(t)): i for p in cfg["probes"] for i, t in enumerate(p["targets"])}
     probes.sort(key=lambda r: ([p["name"] for p in cfg["probes"]].index(r["probe"]), order[(r["probe"], str(r["target"]))]))
     results = {
@@ -815,6 +838,9 @@ def render(cfg, res):
     for n in bad_swaps:
         s = swaps[n]
         out = s.get("outcome")
+        if out == "error":
+            w(f"- **#{n}:** the swap test could not run ({code([s.get('message', '')])}).")
+            continue
         if out in ("conflict", "revert_conflict"):
             what = "still conflicts after the swap" if out == "conflict" else "a blocking PR could not be reverted"
             w(f"- **#{n}:** conflicts with {refs(s['blockers']) or 'the combined build only'}; {what}.")
@@ -851,7 +877,9 @@ def render(cfg, res):
     for n in res["order"]:
         st = steps.get(n, {})
         c = culprits.get(n, {})
-        if c.get("on_base") == "fail":
+        if c.get("error"):
+            other.append(f"- **Culprit search could not run:** #{n} ({code([c['error']])}).")
+        elif c.get("on_base") == "fail":
             other.append(f"- **Fails its own tests on `{snap['base_ref']}`:** #{n} ({code(st.get('failures', []))}).")
         elif c.get("on_base") == "conflict":
             other.append(f"- **Fails in the build and does not merge onto `{snap['base_ref']}` alone:** #{n} ({code(st.get('failures', []))}).")

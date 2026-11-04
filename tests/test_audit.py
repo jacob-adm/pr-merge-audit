@@ -273,6 +273,20 @@ class SmallBuilds(unittest.TestCase):
         self.assertNotIn("python", audit.tool_versions(cfg))
 
 
+    def test_a_failing_job_is_recorded_and_the_rest_kept(self):
+        (self.tmp / "probe.py").write_text(PASSING)
+        probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 2]}]
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        data = json.loads(snap.read_text())
+        data["prs"].append({"number": 2, "title": "gone", "head": "f" * 40, "draft": True, "status": "SUCCESS",
+                            "linked": [], "files": []})  # head not in the bundle, so its export fails
+        snap.write_text(json.dumps(data))
+        res = build(cfg, snap, bundle, self.tmp, "a")
+        self.assertEqual(res["merged"], [1])
+        self.assertEqual([(p["target"], p["outcome"]) for p in res["probes"]], [("base", "pass"), (2, "error")])
+        self.assertTrue(res["probes"][1]["message"])
+
+
 class Classify(unittest.TestCase):
     def cfg(self, **kw):
         cfg = {"test_prefix": "tests/", "order": [], "exclude": {}, "duplicates": {}, "features": {},
@@ -319,6 +333,15 @@ class Helpers(unittest.TestCase):
         cfg = {"failure_pattern": r"^(\S+) (FAILED|ERROR)", "count_pattern": r"^ran: (\S+)"}
         res = audit.scan(cfg, 1, "a.b FAILED\nc.d ERROR\nran: many\n")
         self.assertEqual((res["failures"], res["ran"]), (["a.b", "c.d"], 0))
+
+    def test_job_errors_render(self):
+        res = json.loads((GOLDEN / "results.json").read_text())
+        a, b = (str(x) for x in res["order"][-2:])
+        res["swaps"][a] = {"blockers": [], "outcome": "error", "message": "RuntimeError: boom"}
+        res["culprits"][b] = {"error": "RuntimeError: bang"}
+        text = audit.render({}, res)
+        self.assertIn(f"**#{a}:** the swap test could not run (`RuntimeError: boom`).", text)
+        self.assertIn(f"**Culprit search could not run:** #{b} (`RuntimeError: bang`).", text)
 
     def test_empty_blockers_render_in_words(self):
         res = json.loads((GOLDEN / "results.json").read_text())
@@ -637,6 +660,31 @@ class TokenRedirect(unittest.TestCase):
             else:
                 os.environ["GITHUB_TOKEN"] = old
         self.assertEqual((seen["first"], seen["auth"]), ("Bearer secret", None))
+
+
+class RateLimit(unittest.TestCase):
+    def test_rate_limit_exits_with_a_hint(self):
+        class Limited(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(403, "rate limit exceeded")
+                self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("X-RateLimit-Reset", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Limited)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        saved = {k: os.environ.pop(k) for k in ("GITHUB_TOKEN", "GH_TOKEN") if k in os.environ}
+        self.addCleanup(os.environ.update, saved)
+        with self.assertRaises(SystemExit) as stop:
+            audit.api({"api": f"http://127.0.0.1:{server.server_port}"}, "/y")
+        msg = str(stop.exception.code)
+        for part in ("HTTP 403", "rate limit reached", "1970-01-01 00:00 UTC", "GITHUB_TOKEN"):
+            self.assertIn(part, msg)
 
 
 class Golden(unittest.TestCase):
