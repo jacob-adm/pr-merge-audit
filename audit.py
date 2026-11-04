@@ -3,12 +3,13 @@
 
 Needs only the Python standard library (3.8+) and git (2.38+, for `git merge-tree --write-tree`).
 
-    audit.py snapshot --config config.json            # network: freeze PR heads and metadata
-    audit.py build    --config config.json --snapshot snapshots/DATE.json
-    audit.py report   --config config.json --results results/DATE.json
-    audit.py verify   --config config.json --results results/DATE.json --golden report.md
+    audit.py --config config.json snapshot                                # network: freeze PR heads
+    audit.py --config config.json build --snapshot snapshots/DATE.json    # offline; runs PR code
+    audit.py report --results results/DATE.json [--out report.md]
+    audit.py verify --results results/DATE.json --golden report.md
 
-`build` and `report` are offline. The same snapshot, config and machine give the same report.
+Only `snapshot` uses the network (a GitHub-compatible API). The same snapshot, config and machine
+give the same report.
 """
 
 import argparse
@@ -49,7 +50,6 @@ TEST_ENV = {
     "PYTHONHASHSEED": "0",
     "PYTHONDONTWRITEBYTECODE": "1",
 }
-LINK_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)", re.I)
 MARKER = ".audit-workspace"
 MIN_GIT = (2, 38)
 OUTPUT_CAP = 4 * 1024 * 1024
@@ -214,7 +214,6 @@ def cmd_snapshot(cfg, args):
             "head": head,
             "draft": bool(p.get("draft")),
             "status": required_status(cfg, head),
-            "linked": sorted({int(x) for x in LINK_RE.findall(p.get("body") or "")}),
             "files": sorted(files),
         })
     snap = {"date": date, "repo": cfg["repo"], "base_ref": cfg["base"], "base_sha": base_sha, "prs": prs}

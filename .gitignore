@@ -1,9 +1,10 @@
 work/
-snapshots/*.bundle
-__pycache__/
-*.pyc
-build.log
 results/
 reports/
 *.bundle
 build*.log
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
