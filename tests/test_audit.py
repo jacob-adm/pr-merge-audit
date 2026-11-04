@@ -177,12 +177,12 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
 
 
-def small_project(tmp, base_test, status):
+def small_project(tmp, base_test, status, base_files=None, **cfg):
     """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
     repo = tmp / "src"
     repo.mkdir()
     sh(repo, "git", "init", "-q", "-b", "main")
-    base = commit(repo, {"app.py": "X = 1\n", "tests/test_base.py": base_test}, "base")
+    base = commit(repo, dict({"app.py": "X = 1\n", "tests/test_base.py": base_test}, **(base_files or {})), "base")
     head = branch(repo, "p1", {"tests/test_p1.py": "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"})
     sh(repo, "git", "update-ref", "refs/audit/base", base)
     sh(repo, "git", "update-ref", "refs/audit/pr/1", head)
@@ -193,7 +193,7 @@ def small_project(tmp, base_test, status):
                                 "prs": [{"number": 1, "title": "p1", "head": head, "draft": False, "status": status,
                                          "linked": [], "files": ["tests/test_p1.py"]}]}))
     config = tmp / "config.json"
-    config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", required_status="ci", workers=1)))
+    config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", required_status="ci", workers=1, **cfg)))
     return audit.load_config(str(config)), snap, bundle
 
 
@@ -232,6 +232,28 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("**Override:** required status check `ci` ignored.", audit.render(cfg, res))
 
 
+    def test_lfs_base_stops_the_build_unless_allowed(self):
+        lfs = {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n"}
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", lfs)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("Git LFS files", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+        cfg["allow_incomplete_checkout"] = True
+        res = build(cfg, snap, bundle, self.tmp, "b")
+        self.assertEqual(res["merged"], [1])
+        self.assertIn("**Override:** test runs lack Git LFS files", audit.render(cfg, res))
+
+    def test_bad_probe_target_stops_before_any_test(self):
+        (self.tmp / "probe.py").write_text(PASSING)
+        probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 99]}]
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("target 99", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+
+
 class Classify(unittest.TestCase):
     def cfg(self, **kw):
         cfg = {"test_prefix": "tests/", "order": [], "exclude": {}, "duplicates": {}, "features": {},
@@ -264,6 +286,12 @@ class Classify(unittest.TestCase):
 
 
 class Helpers(unittest.TestCase):
+    def test_git_version(self):
+        self.assertEqual(audit.git_version("git version 2.50.1 (Apple Git-155)"), (2, 50))
+        self.assertEqual(audit.git_version("git version 2.45.1.windows.1"), (2, 45))
+        self.assertLess(audit.git_version("git version 2.37.9"), audit.MIN_GIT)
+        self.assertLess(audit.git_version(""), audit.MIN_GIT)
+
     def test_names_keeps_spaces(self):
         self.assertEqual(audit.names("a b.py\0c.py\0"), ["a b.py", "c.py"])
 
@@ -366,8 +394,8 @@ def mktree(repo, entries):
     """Tree from (mode, name, blob text or subtree id) rows, so a test can hold any names and links."""
     rows = []
     for mode, name, value in entries:
-        kind = "tree" if mode == "040000" else "blob"
-        oid = value if kind == "tree" else git_in(repo, "hash-object", "-w", "--stdin", data=value)
+        kind = {"040000": "tree", "160000": "commit"}.get(mode, "blob")
+        oid = value if kind != "blob" else git_in(repo, "hash-object", "-w", "--stdin", data=value)
         rows.append(f"{mode} {kind} {oid}\t{name}\n")
     return git_in(repo, "mktree", data="".join(rows))
 
@@ -457,6 +485,26 @@ class HostileTrees(TreeFixture, unittest.TestCase):
         else:
             os.kill(pid, 9)
             self.fail("background process outlived the test run")
+
+
+class Unsupported(TreeFixture, unittest.TestCase):
+    """Setups the tool cannot test faithfully are detected, not silently mis-read."""
+
+    def test_gitlink_and_nested_lfs_are_detected(self):
+        lfs = mktree(self.src, [("100644", ".gitattributes", "*.bin filter=lfs -text\n")])
+        tree = mktree(self.src, [("160000", "vendor", "1" * 40), ("040000", "assets", lfs)])
+        ws, head = self.workspace(tree)
+        self.assertEqual(ws.incomplete_checkout(head), ["submodules", "Git LFS files"])
+
+    def test_plain_tree_is_complete(self):
+        ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
+        self.assertEqual(ws.incomplete_checkout(head), [])
+
+    def test_merge_tree_error_is_not_read_as_no_conflict(self):
+        ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
+        ws.heads[5] = "0" * 40
+        with self.assertRaises(RuntimeError):
+            ws.conflicts("base", 5)
 
 
 ENV_TEST = ("import os, unittest\n"

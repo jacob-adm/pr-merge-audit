@@ -136,6 +136,7 @@ the number of follow-up runs, depends on the PRs.
 | `python`, `workers` | Interpreter for tests (default: the one running the tool), parallel jobs |
 | `pass_env` | Names of variables copied from your environment into test runs (e.g. `RUSTUP_HOME`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`) |
 | `env` | Variables set in test runs, applied last (can override `HOME`) |
+| `allow_incomplete_checkout` | Run even though the base uses submodules or Git LFS, which test runs lack (shown in the report) |
 | `setup_cmd` | Command run before `test_cmd` in the same copy (e.g. installing dependencies); if it fails, the run fails as `(setup failed)` |
 | `order` | Merge order; it decides which side of each conflict merged first |
 | `exclude`, `duplicates`, `features` | PR number to reason; these PRs are not tried |
