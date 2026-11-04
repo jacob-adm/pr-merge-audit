@@ -57,7 +57,8 @@ build can be re-run later even after PR branches move or are deleted.
 
 Merge commits use a fixed identity and timestamp, global and system git config are ignored,
 and tests run with a fixed locale, time zone and hash seed, a private `HOME` and `TMPDIR`, and
-none of the caller's environment variables other than `PATH` (plus proxy and certificate settings).
+none of the caller's environment variables other than `PATH` (plus proxy and certificate settings)
+and those listed in `pass_env`.
 
 ## Security
 
@@ -85,7 +86,8 @@ What the tool does to limit damage short of that:
   processes the tests leave in the background stop with it (unless they start their own session).
 - Git runs with system and global config ignored, hooks pointed at the null device,
   `core.fsmonitor` off and only `PATH` (plus proxy and certificate settings) taken from your
-  environment. Subprocesses never go through a shell.
+  environment. Subprocesses never go through a shell. Test runs also get the variables you list in
+  `pass_env` and `env`; anything listed there is visible to every PR's code.
 - Test output is written to disk and at most 4 MB of it is read back.
 - Text taken from test output is put in the report only inside code spans, with backticks
   replaced, `|` escaped in tables, control characters removed and a length cap, so it cannot add
@@ -132,6 +134,9 @@ the number of follow-up runs, depends on the PRs.
 | `skipped_pattern`, `message_pattern` | Regexes for the skipped count and the first error message |
 | `test_files` | Regex for test files, used to decide whether a PR changes tests (default: anything under `test_prefix`) |
 | `python`, `workers` | Interpreter for tests (default: the one running the tool), parallel jobs |
+| `pass_env` | Names of variables copied from your environment into test runs (e.g. `RUSTUP_HOME`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`) |
+| `env` | Variables set in test runs, applied last (can override `HOME`) |
+| `setup_cmd` | Command run before `test_cmd` in the same copy (e.g. installing dependencies); if it fails, the run fails as `(setup failed)` |
 | `order` | Merge order; it decides which side of each conflict merged first |
 | `exclude`, `duplicates`, `features` | PR number to reason; these PRs are not tried |
 | `no_tests_ok` | PRs tried even though they change no tests |

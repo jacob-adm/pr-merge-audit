@@ -372,8 +372,8 @@ def mktree(repo, entries):
     return git_in(repo, "mktree", data="".join(rows))
 
 
-class HostileTrees(unittest.TestCase):
-    """Commits a PR author could push, run through the real export and test steps."""
+class TreeFixture:
+    """A one-commit repository built from raw trees, bundled and opened as a Workspace."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -387,16 +387,20 @@ class HostileTrees(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def workspace(self, tree):
+    def workspace(self, tree, **cfg):
         head = git_in(self.src, "commit-tree", tree, "-m", "pr")
         git_in(self.src, "update-ref", "refs/audit/base", head)
         bundle = self.tmp / "b.bundle"
         git_in(self.src, "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
-        cfg = dict(UNITTEST, test_timeout=60, python=sys.executable)
+        cfg = dict(UNITTEST, test_timeout=60, python=sys.executable, **cfg)
         return audit.Workspace(cfg, {"base_sha": head, "prs": []}, bundle, self.tmp / "work"), head
 
     def pr_tree(self, files):
         return mktree(self.src, [("040000", "tests", mktree(self.src, [("100644", k, v) for k, v in files.items()]))])
+
+
+class HostileTrees(TreeFixture, unittest.TestCase):
+    """Commits a PR author could push, run through the real export and test steps."""
 
     def test_chained_link_is_pruned_and_never_written_through(self):
         # sub/s points at the copy's root, so the text of T cancels out while on disk it climbs to /.
@@ -453,6 +457,52 @@ class HostileTrees(unittest.TestCase):
         else:
             os.kill(pid, 9)
             self.fail("background process outlived the test run")
+
+
+ENV_TEST = ("import os, unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_env(self):\n"
+            "        self.assertEqual(os.environ.get('AUDIT_PASSED'), 'from-caller')\n"
+            "        self.assertEqual(os.environ.get('AUDIT_FIXED'), 'from-config')\n"
+            "        self.assertIsNone(os.environ.get('AUDIT_NOT_LISTED'))\n")
+SETUP_TEST = "import unittest\nclass T(unittest.TestCase):\n    def test_setup(self): import generated\n"
+UNITTEST_ARGV = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+
+
+class Toolchain(TreeFixture, unittest.TestCase):
+    """pass_env, env and setup_cmd reach the real test process."""
+
+    def test_pass_env_and_env_reach_tests(self):
+        os.environ.update(AUDIT_PASSED="from-caller", AUDIT_NOT_LISTED="secret")
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("AUDIT_PASSED", "AUDIT_NOT_LISTED")])
+        ws, head = self.workspace(self.pr_tree({"test_env.py": ENV_TEST}),
+                                  pass_env=["AUDIT_PASSED"], env={"AUDIT_FIXED": "from-config"})
+        self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
+
+    def test_unlisted_variables_stay_out(self):
+        os.environ["AUDIT_PASSED"] = "from-caller"
+        self.addCleanup(os.environ.pop, "AUDIT_PASSED", None)
+        ws, head = self.workspace(self.pr_tree({"test_env.py": ENV_TEST}))
+        self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "fail")
+
+    def test_setup_cmd_runs_first_in_the_same_copy(self):
+        setup = ["{python}", "-c", "open('tests/generated.py', 'w').write('X = 1\\n')"]
+        ws, head = self.workspace(self.pr_tree({"test_setup.py": SETUP_TEST}), setup_cmd=setup)
+        self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
+
+    def test_failed_setup_is_a_failure_and_tests_do_not_run(self):
+        setup = ["{python}", "-c", "import sys; print('no toolchain'); sys.exit(3)"]
+        ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}), setup_cmd=setup)
+        res = ws.test_once(ws.tree("t", head), UNITTEST_ARGV)
+        self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(setup failed)"]))
+        self.assertEqual(res["message"], "setup_cmd exit status 3: no toolchain")
+
+    def test_config_rejects_malformed_keys(self):
+        for bad in ({"pass_env": "PATH"}, {"env": {"A": 1}}, {"setup_cmd": "make"}, {"setup_cmd": []}):
+            path = self.tmp / "c.json"
+            path.write_text(json.dumps(dict(UNITTEST, **bad)))
+            with self.assertRaises(SystemExit, msg=bad):
+                audit.load_config(path)
 
 
 class TokenRedirect(unittest.TestCase):
