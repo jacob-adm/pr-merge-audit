@@ -72,6 +72,14 @@ def load_config(path):
         cfg[key] = {int(k): v for k, v in cfg.get(key, {}).items()}
     cfg["no_tests_ok"] = set(cfg.get("no_tests_ok", []))
     cfg.setdefault("probes", [])
+    cfg.setdefault("pass_env", [])
+    cfg.setdefault("env", {})
+    if not (isinstance(cfg["pass_env"], list) and all(isinstance(k, str) for k in cfg["pass_env"])):
+        sys.exit(f"{path}: pass_env must be a list of variable names")
+    if not (isinstance(cfg["env"], dict) and all(isinstance(v, str) for v in cfg["env"].values())):
+        sys.exit(f"{path}: env must map variable names to strings")
+    if "setup_cmd" in cfg and not (isinstance(cfg["setup_cmd"], list) and cfg["setup_cmd"]):
+        sys.exit(f"{path}: setup_cmd must be a non-empty list of arguments")
     cfg["_dir"] = Path(path).resolve().parent
     return cfg
 
@@ -224,6 +232,14 @@ def scan(cfg, rc, out):
     return res
 
 
+def setup_failure(rc, out):
+    """Result for a run whose setup_cmd failed; the tests never ran."""
+    lines = [x for x in out.splitlines() if x.strip()]
+    detail = "timeout" if rc is None else f"exit status {rc}"
+    return {"outcome": "fail", "failures": ["(setup failed)"],
+            "message": f"setup_cmd {detail}" + (f": {lines[-1].strip()}" if lines else "")}
+
+
 def read_capped(path):
     size = path.stat().st_size
     with open(path, "rb") as f:
@@ -346,9 +362,15 @@ class Workspace:
         return scratch, root
 
     def run_in(self, scratch, root, argv):
-        """Run `argv` in `root` with a private HOME and TMPDIR; output is kept on disk and capped."""
+        """Run `argv` in `root` with a private HOME and TMPDIR; output is kept on disk and capped.
+
+        Variables named in `pass_env` are copied from the caller and `env` is applied last, so a
+        toolchain that lives outside PATH (rustup, Go, a virtualenv) can still be reached.
+        """
         env = dict(base_env(), **TEST_ENV)
+        env.update({k: os.environ[k] for k in self.cfg.get("pass_env", []) if k in os.environ})
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"))
+        env.update(self.cfg.get("env", {}))
         log = scratch / "output.log"
         posix = hasattr(os, "killpg")
         with open(log, "wb") as f:
@@ -370,13 +392,28 @@ class Workspace:
                 proc.wait()
         return rc, read_capped(log)
 
+    def execute(self, scratch, root, argv):
+        """Run `setup_cmd` (if configured), then `argv`, in the same copy.
+
+        Returns (rc, output, setup_failed); a failed setup skips `argv`.
+        """
+        setup = self.cfg.get("setup_cmd")
+        if setup:
+            rc, out = self.run_in(scratch, root, [a.format(python=self.cfg["python"]) for a in setup])
+            if rc != 0:
+                return rc, out, True
+        rc, out = self.run_in(scratch, root, argv)
+        return rc, out, False
+
     def test_once(self, wt, argv):
         self.count()
         scratch, root = self.export(git(wt, "rev-parse", "HEAD").stdout.strip())
         try:
-            rc, out = self.run_in(scratch, root, argv)
+            rc, out, setup_failed = self.execute(scratch, root, argv)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+        if setup_failed:
+            return setup_failure(rc, out)
         if rc is None:
             return {"outcome": "fail", "failures": ["(timeout)"]}
         return scan(self.cfg, rc, out)
@@ -511,9 +548,11 @@ def run_probe(ws, probe, target):
         if refused:
             return dict(row, outcome="error", message=refused)
         ws.count()
-        rc, out = ws.run_in(scratch, root, argv)
+        rc, out, setup_failed = ws.execute(scratch, root, argv)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+    if setup_failed:
+        return dict(row, outcome="fail", message=setup_failure(rc, out)["message"])
     if rc is None:
         return dict(row, outcome="fail", message="(timeout)")
     res = scan(ws.cfg, rc, out)
