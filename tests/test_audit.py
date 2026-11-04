@@ -177,13 +177,13 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
 
 
-def small_project(tmp, base_test, status, base_files=None, **cfg):
+def small_project(tmp, base_test, status, base_files=None, pr_test=None, **cfg):
     """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
     repo = tmp / "src"
     repo.mkdir()
     sh(repo, "git", "init", "-q", "-b", "main")
     base = commit(repo, dict({"app.py": "X = 1\n", "tests/test_base.py": base_test}, **(base_files or {})), "base")
-    head = branch(repo, "p1", {"tests/test_p1.py": "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"})
+    head = branch(repo, "p1", {"tests/test_p1.py": pr_test or "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"})
     sh(repo, "git", "update-ref", "refs/audit/base", base)
     sh(repo, "git", "update-ref", "refs/audit/pr/1", head)
     bundle = tmp / "snap.bundle"
@@ -254,6 +254,25 @@ class SmallBuilds(unittest.TestCase):
         self.assertFalse((self.tmp / "work-a").exists())
 
 
+    def test_flaky_pr_gets_no_culprit_search_and_one_label(self):
+        marker = self.tmp / "ran-once"
+        flaky = ("import os, unittest\nclass T(unittest.TestCase):\n    def test_p1(self):\n"
+                 f"        if not os.path.exists({str(marker)!r}):\n"
+                 f"            open({str(marker)!r}, 'w').close()\n            self.fail('first run')\n")
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", pr_test=flaky)
+        res = build(cfg, snap, bundle, self.tmp, "a")
+        self.assertEqual((res["steps"][0]["outcome"], res["culprits"], res["test_runs"]["culprit"]), ("flaky", {}, 0))
+        text = audit.render(cfg, res)
+        self.assertIn("**Flaky (failed, then passed on re-run):** #1.", text)
+        self.assertNotIn("no single culprit", text)
+
+    def test_environment_line_names_python_only_when_used(self):
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        self.assertIn("python", audit.tool_versions(cfg))
+        cfg = dict(cfg, test_cmd=[sys.executable, "-m", "unittest"])
+        self.assertNotIn("python", audit.tool_versions(cfg))
+
+
 class Classify(unittest.TestCase):
     def cfg(self, **kw):
         cfg = {"test_prefix": "tests/", "order": [], "exclude": {}, "duplicates": {}, "features": {},
@@ -291,6 +310,23 @@ class Helpers(unittest.TestCase):
         self.assertEqual(audit.git_version("git version 2.45.1.windows.1"), (2, 45))
         self.assertLess(audit.git_version("git version 2.37.9"), audit.MIN_GIT)
         self.assertLess(audit.git_version(""), audit.MIN_GIT)
+
+    def test_fill_leaves_other_braces(self):
+        self.assertEqual(audit.fill(["{python}", "{1..3}", '{"a": 1}', "{dest}"], python="py", dest=Path("t/x.py")),
+                         ["py", "{1..3}", '{"a": 1}', "t/x.py"])
+
+    def test_scan_uses_group_one_and_ignores_non_numbers(self):
+        cfg = {"failure_pattern": r"^(\S+) (FAILED|ERROR)", "count_pattern": r"^ran: (\S+)"}
+        res = audit.scan(cfg, 1, "a.b FAILED\nc.d ERROR\nran: many\n")
+        self.assertEqual((res["failures"], res["ran"]), (["a.b", "c.d"], 0))
+
+    def test_empty_blockers_render_in_words(self):
+        res = json.loads((GOLDEN / "results.json").read_text())
+        n = str(res["order"][-1])
+        res["swaps"][n] = {"blockers": [], "outcome": "conflict"}
+        text = audit.render({}, res)
+        self.assertIn(f"**#{n}:** conflicts with the combined build only; still conflicts", text)
+        self.assertNotIn("with ;", text)
 
     def test_names_keeps_spaces(self):
         self.assertEqual(audit.names("a b.py\0c.py\0"), ["a b.py", "c.py"])
@@ -500,6 +536,11 @@ class Unsupported(TreeFixture, unittest.TestCase):
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
         self.assertEqual(ws.incomplete_checkout(head), [])
 
+    def test_conflict_with_base_is_not_called_a_test_failure(self):
+        ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
+        ws.heads[5] = git_in(self.src, "commit-tree", self.pr_tree({"test_ok.py": PASSING + "# changed\n"}), "-m", "unrelated")
+        self.assertEqual(audit.find_culprit(ws, 5, [], "c"), {"on_base": "conflict"})
+
     def test_merge_tree_error_is_not_read_as_no_conflict(self):
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
         ws.heads[5] = "0" * 40
@@ -535,6 +576,11 @@ class Toolchain(TreeFixture, unittest.TestCase):
 
     def test_setup_cmd_runs_first_in_the_same_copy(self):
         setup = ["{python}", "-c", "open('tests/generated.py', 'w').write('X = 1\\n')"]
+        ws, head = self.workspace(self.pr_tree({"test_setup.py": SETUP_TEST}), setup_cmd=setup)
+        self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
+
+    def test_braces_in_commands_are_kept(self):
+        setup = ["{python}", "-c", "d = {'a': 1}; open('tests/generated.py', 'w').write('X = 1')"]
         ws, head = self.workspace(self.pr_tree({"test_setup.py": SETUP_TEST}), setup_cmd=setup)
         self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
 
