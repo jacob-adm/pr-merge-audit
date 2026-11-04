@@ -100,7 +100,7 @@ def make_project(tmp):
     for n, head in heads.items():
         files = audit.names(sh(repo, "git", "diff", "--name-only", "-z", f"{base}...{head}") + "\0")
         prs.append({"number": n, "title": f"p{n}", "head": head, "draft": False,
-                    "status": "FAILURE" if n == 7 else "SUCCESS", "linked": [], "files": sorted(files)})
+                    "status": "FAILURE" if n == 7 else "SUCCESS", "files": sorted(files)})
     snap = tmp / "snap.json"
     snap.write_text(json.dumps({"date": "test", "repo": "local/test", "base_ref": "main",
                                 "base_sha": base, "prs": prs}))
@@ -191,7 +191,7 @@ def small_project(tmp, base_test, status, base_files=None, pr_test=None, **cfg):
     snap = tmp / "snap.json"
     snap.write_text(json.dumps({"date": "test", "repo": "local/test", "base_ref": "main", "base_sha": base,
                                 "prs": [{"number": 1, "title": "p1", "head": head, "draft": False, "status": status,
-                                         "linked": [], "files": ["tests/test_p1.py"]}]}))
+                                         "files": ["tests/test_p1.py"]}]}))
     config = tmp / "config.json"
     config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", required_status="ci", workers=1, **cfg)))
     return audit.load_config(str(config)), snap, bundle
@@ -279,7 +279,7 @@ class SmallBuilds(unittest.TestCase):
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
         data = json.loads(snap.read_text())
         data["prs"].append({"number": 2, "title": "gone", "head": "f" * 40, "draft": True, "status": "SUCCESS",
-                            "linked": [], "files": []})  # head not in the bundle, so its export fails
+                            "files": []})  # head not in the bundle, so its export fails
         snap.write_text(json.dumps(data))
         res = build(cfg, snap, bundle, self.tmp, "a")
         self.assertEqual(res["merged"], [1])

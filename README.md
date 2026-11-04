@@ -14,10 +14,27 @@ file kept with that project, not here. `config.example.json` is a starting point
 
 - Python 3.8 or later, standard library only
 - git 2.38 or later (`git merge-tree --write-tree`)
-- For `snapshot` only: a GitHub-compatible API and `refs/pull/N/head` refs. Optional:
-  `GITHUB_TOKEN` in the environment (unauthenticated API access is rate-limited). `build`,
-  `report` and `verify` read only the snapshot file and bundle, so a snapshot made any other
-  way works too.
+- For `snapshot` only: GitHub (github.com, or GitHub Enterprise through `api`). Optional:
+  `GITHUB_TOKEN` in the environment (unauthenticated API access is rate-limited).
+
+`snapshot` is the only GitHub-specific step. For another host (GitLab, Gitea, Bitbucket), write
+the two snapshot files yourself and run `build` on them:
+
+- `snapshots/DATE.json`: `{"date", "repo", "base_ref", "base_sha", "prs": [{"number", "title",
+  "head", "draft", "status", "files"}]}`, where `status` is `SUCCESS` when the PR passes your
+  required check and `files` lists the paths it changes against the base.
+- `snapshots/DATE.bundle`: a `git bundle` holding `refs/audit/base` and `refs/audit/pr/N` for
+  each PR.
+
+## Install
+
+```
+pip install git+https://github.com/jacob-adm/pr-merge-audit
+pr-merge-audit --help
+```
+
+or run `python3 audit.py` from a clone; it has no dependencies. The commands below use
+`python3 audit.py`; `pr-merge-audit` takes the same arguments.
 
 ## Usage
 
@@ -172,3 +189,7 @@ python3 audit.py verify --results tests/golden/results.json --golden tests/golde
 
 which renders the report twice and compares both renders with the golden copy byte for byte.
 After a deliberate change to the report, rebuild the fixture and replace both files.
+
+## License
+
+Apache License 2.0; see `LICENSE`.
