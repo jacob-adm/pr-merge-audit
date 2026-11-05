@@ -12,11 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest]
+        # macOS runners are left out while the repository is private.
+        os: [ubuntu-22.04]
         python: ["3.8", "3.13"]
-        exclude:
-          - os: macos-latest
-            python: "3.8"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
