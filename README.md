@@ -138,6 +138,42 @@ The estimate uses the counts in the reference results, scaled by how many PRs th
 would try. It is a guide, not a promise: the number of conflicts and failures, and so
 the number of follow-up runs, depends on the PRs.
 
+The results file also records the measured time of every run under `timing`, by phase:
+the count, total, median and maximum seconds, and the wall-clock time of the sequential build
+and of the follow-ups.
+
+### A measured build
+
+One full build of a Python project with 111 open PRs, on an Apple M4 Pro (14 cores,
+macOS 26) with `workers: 4`. The tool tried 76 PRs. 53 merged, 18 conflicted and 5 failed.
+The suite grew from 70 tests on the base to 248 after the last merge.
+
+| Phase | Runs | Median run | Longest run |
+| :--- | ---: | ---: | ---: |
+| Sequential build | 64 | 76 s | 139 s |
+| Swap tests | 14 | 163 s | 189 s |
+| Culprit searches (5 PRs) | 57 | 62 s | 148 s |
+| Probes | 3 | 0.5 s | 0.8 s |
+
+Wall clock: 72 min for the sequential build, 38 min for the follow-ups (swaps, culprit
+searches and probes on 4 workers), 110 min in total.
+
+Use these numbers to estimate a build of your own repository:
+
+```
+sequential  ≈ (1 + merged + 2 × failed) × suite time
+follow-ups  ≈ (conflicts + 11 × failed) × suite time ÷ workers   (at least one culprit search, ~11 runs, end to end)
+total       ≈ sequential + follow-ups
+```
+
+Here "suite time" is the average time of one test-suite run across the build. Since every
+merge can add tests, it grows as the build goes on, so time the suite on a branch near the
+end state rather than on the base. In the example the suite ran in 68 s on average, so the
+formula gives (1 + 53 + 10) × 68 s ≈ 73 min, and (18 + 55) × 68 s ÷ 4 ≈ 21 min, which is
+lower than the 38 min measured. The difference is the longest culprit search, which bisects
+one step at a time, and the swap tests, which run the full suite after the whole merge
+sequence. Treat the follow-up figure as a minimum.
+
 ## Configuration
 
 | Key | Meaning |
