@@ -171,7 +171,16 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertEqual(self.res["test_runs"]["sequence"], 8)
 
     def test_same_inputs_same_results(self):
-        self.assertEqual(self.res, self.again)
+        strip = lambda r: {k: v for k, v in r.items() if k != "timing"}
+        self.assertEqual(strip(self.res), strip(self.again))
+
+    def test_timing_matches_run_counts(self):
+        t = self.res["timing"]
+        for phase in ("sequence", "swap", "culprit", "probe"):
+            self.assertEqual(t["run_seconds"][phase]["count"], self.res["test_runs"][phase], phase)
+        self.assertGreater(t["run_seconds"]["sequence"]["median"], 0)
+        w = t["wall_seconds"]
+        self.assertAlmostEqual(w["total"], w["sequence"] + w["follow_ups"], delta=0.2)
 
     def test_report_is_deterministic(self):
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))

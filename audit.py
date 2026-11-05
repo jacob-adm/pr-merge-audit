@@ -345,6 +345,7 @@ class Workspace:
         self.lock = threading.Lock()
         self.local = threading.local()
         self.runs = {"sequence": 0, "swap": 0, "culprit": 0, "probe": 0}
+        self.seconds = {k: [] for k in self.runs}  # duration of each test-suite run (setup included)
         if self.work.exists() and any(self.work.iterdir()):
             if not (self.work / MARKER).is_file():
                 sys.exit(f"refusing to clear {self.work}: no {MARKER} marker, so not a build directory")
@@ -473,6 +474,14 @@ class Workspace:
 
         Returns (rc, output, setup_failed); a failed setup skips `argv`.
         """
+        start = time.monotonic()
+        try:
+            return self._execute(scratch, root, argv)
+        finally:
+            with self.lock:
+                self.seconds[getattr(self.local, "phase", "sequence")].append(time.monotonic() - start)
+
+    def _execute(self, scratch, root, argv):
         setup = self.cfg.get("setup_cmd")
         if setup:
             rc, out = self.run_in(scratch, root, fill(setup, python=self.cfg["python"]))
@@ -649,6 +658,16 @@ def tool_versions(cfg):
     return tools
 
 
+def timing_summary(wall, seconds):
+    """Wall time per phase and test-run durations, for sizing later builds. Never rendered in the report."""
+    def stats(xs):
+        xs = sorted(xs)
+        return {"count": len(xs), "total": round(sum(xs), 1), "median": round(xs[len(xs) // 2], 2) if xs else 0,
+                "max": round(xs[-1], 2) if xs else 0}
+    return {"wall_seconds": {k: round(v, 1) for k, v in wall.items()},
+            "run_seconds": {k: stats(v) for k, v in seconds.items()}}
+
+
 def cmd_build(cfg, args):
     check_git()
     snap = json.loads(Path(args.snapshot).read_text())
@@ -660,6 +679,7 @@ def cmd_build(cfg, args):
     if args.ignore_status and cfg.get("required_status"):
         overrides.append(f"required status check `{cfg['required_status']}` ignored")
         cfg = dict(cfg, required_status="")
+    started = time.monotonic()
     ws = Workspace(cfg, snap, bundle, args.work)
     missing = " and ".join(ws.incomplete_checkout(ws.base))
     if missing and not cfg.get("allow_incomplete_checkout"):
@@ -671,6 +691,7 @@ def cmd_build(cfg, args):
     seq, not_tried = classify(cfg, snap)
     print(f"merging {len(seq)} PRs in order", flush=True)
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
+    sequence_done = time.monotonic()
     if base_result["outcome"] not in ("pass", "flaky"):
         shutil.rmtree(ws.work, ignore_errors=True)
         detail = ", ".join(base_result.get("failures", [])) + (": " + base_result["message"] if base_result.get("message") else "")
@@ -707,6 +728,7 @@ def cmd_build(cfg, args):
             else:
                 probes.append(result)
     order = {(p["name"], str(t)): i for p in cfg["probes"] for i, t in enumerate(p["targets"])}
+    follow_ups_done = time.monotonic()
     probes.sort(key=lambda r: ([p["name"] for p in cfg["probes"]].index(r["probe"]), order[(r["probe"], str(r["target"]))]))
     results = {
         "snapshot": {k: snap[k] for k in ("date", "repo", "base_ref", "base_sha")},
@@ -729,6 +751,8 @@ def cmd_build(cfg, args):
         "culprits": dict(sorted(culprits.items(), key=lambda kv: seq.index(int(kv[0])))),
         "probes": probes,
         "test_runs": dict(ws.runs, workers=cfg["workers"]),
+        "timing": timing_summary({"total": follow_ups_done - started, "sequence": sequence_done - started,
+                                  "follow_ups": follow_ups_done - sequence_done}, ws.seconds),
     }
     out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
