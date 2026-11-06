@@ -186,13 +186,13 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
 
 
-def small_project(tmp, base_test, status, base_files=None, pr_test=None, **cfg):
+def small_project(tmp, base_test, status, base_files=None, pr_test=None, pr_files=None, **cfg):
     """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
     repo = tmp / "src"
     repo.mkdir()
     sh(repo, "git", "init", "-q", "-b", "main")
     base = commit(repo, dict({"app.py": "X = 1\n", "tests/test_base.py": base_test}, **(base_files or {})), "base")
-    head = branch(repo, "p1", {"tests/test_p1.py": pr_test or "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"})
+    head = branch(repo, "p1", dict({"tests/test_p1.py": pr_test or "import unittest\nclass T(unittest.TestCase):\n    def test_p1(self): pass\n"}, **(pr_files or {})))
     sh(repo, "git", "update-ref", "refs/audit/base", base)
     sh(repo, "git", "update-ref", "refs/audit/pr/1", head)
     bundle = tmp / "snap.bundle"
@@ -253,6 +253,26 @@ class SmallBuilds(unittest.TestCase):
         self.assertEqual(res["merged"], [1])
         self.assertIn("**Override:** test runs lack Git LFS files", audit.render(cfg, res))
 
+    def test_lfs_added_by_a_pr_stops_the_build_unless_allowed(self):
+        lfs = {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n"}
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", pr_files=lfs)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("#1 (Git LFS files)", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+        cfg["allow_incomplete_checkout"] = True
+        res = build(cfg, snap, bundle, self.tmp, "b")
+        self.assertIn("**Override:** test runs of PRs #1 (Git LFS files) lack", audit.render(cfg, res))
+
+    def test_probe_without_targets_stops_before_any_test(self):
+        (self.tmp / "probe.py").write_text(PASSING)
+        probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD}]
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("no targets", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+
     def test_bad_probe_target_stops_before_any_test(self):
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 99]}]
@@ -294,6 +314,17 @@ class SmallBuilds(unittest.TestCase):
         self.assertEqual(res["merged"], [1])
         self.assertEqual([(p["target"], p["outcome"]) for p in res["probes"]], [("base", "pass"), (2, "error")])
         self.assertTrue(res["probes"][1]["message"])
+
+
+class JobErrors(unittest.TestCase):
+    def test_every_kind_of_failed_job_is_recorded(self):
+        exc = RuntimeError("boom")
+        self.assertEqual(audit.job_error("swap", 5, exc), {"blockers": [], "outcome": "error", "message": "RuntimeError: boom"})
+        self.assertEqual(audit.job_error("culprit", 5, exc), {"error": "RuntimeError: boom"})
+        self.assertEqual(audit.job_error("probe", ("p", 2), exc)["target"], 2)
+
+    def test_median_of_an_even_count_is_the_mean_of_the_middle_two(self):
+        self.assertEqual(audit.timing_summary({}, {"swap": [10, 100]})["run_seconds"]["swap"]["median"], 55)
 
 
 class Classify(unittest.TestCase):

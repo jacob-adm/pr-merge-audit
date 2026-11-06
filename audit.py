@@ -21,6 +21,7 @@ import platform
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -133,7 +134,9 @@ def check_probes(cfg, snap):
     for probe in cfg["probes"]:
         if not (cfg["_dir"] / probe["file"]).is_file():
             sys.exit(f"probe {probe['name']!r}: file {probe['file']} not found next to the config")
-        for target in probe.get("targets", []):
+        if not probe.get("targets"):
+            sys.exit(f"probe {probe['name']!r}: no targets; list \"base\" and/or PR numbers")
+        for target in probe["targets"]:
             if target != "base" and target not in numbers:
                 sys.exit(f"probe {probe['name']!r}: target {target!r} is neither \"base\" nor an open PR in the snapshot")
 
@@ -602,7 +605,10 @@ def swap(ws, n, merged, tip):
         ws.drop(wt)
     if res["outcome"] not in ("pass", "flaky"):
         rest = [m["pr"] for m in merged if m["pr"] not in blockers]
-        res["culprit"] = find_culprit(ws, n, rest, f"cul-swap-{n}")
+        try:
+            res["culprit"] = find_culprit(ws, n, rest, f"cul-swap-{n}")
+        except Exception as exc:  # keep the finished swap test
+            res["culprit"] = {"error": f"{type(exc).__name__}: {exc}"}
     return res
 
 
@@ -658,11 +664,21 @@ def tool_versions(cfg):
     return tools
 
 
+def job_error(kind, n, exc):
+    """The result recorded for a follow-up job that raised."""
+    error = f"{type(exc).__name__}: {exc}"
+    if kind == "swap":
+        return {"blockers": [], "outcome": "error", "message": error}
+    if kind == "culprit":
+        return {"error": error}
+    return {"probe": n[0], "target": n[1], "outcome": "error", "message": error}
+
+
 def timing_summary(wall, seconds):
     """Wall time per phase and test-run durations, for sizing later builds. Never rendered in the report."""
     def stats(xs):
         xs = sorted(xs)
-        return {"count": len(xs), "total": round(sum(xs), 1), "median": round(xs[len(xs) // 2], 2) if xs else 0,
+        return {"count": len(xs), "total": round(sum(xs), 1), "median": round(statistics.median(xs), 2) if xs else 0,
                 "max": round(xs[-1], 2) if xs else 0}
     return {"wall_seconds": {k: round(v, 1) for k, v in wall.items()},
             "run_seconds": {k: stats(v) for k, v in seconds.items()}}
@@ -689,6 +705,14 @@ def cmd_build(cfg, args):
     if missing:
         overrides.append(f"test runs lack {missing} (allow_incomplete_checkout)")
     seq, not_tried = classify(cfg, snap)
+    lacking = {n: ws.incomplete_checkout(ws.heads[n]) for n in seq}
+    lacking = ", ".join(f"#{n} ({' and '.join(m)})" for n, m in lacking.items() if m)
+    if lacking and not cfg.get("allow_incomplete_checkout"):
+        shutil.rmtree(ws.work, ignore_errors=True)
+        sys.exit(f"PRs {lacking} add content test runs would not contain; "
+                 f"set allow_incomplete_checkout to run anyway")
+    if lacking:
+        overrides.append(f"test runs of PRs {lacking} lack that content (allow_incomplete_checkout)")
     print(f"merging {len(seq)} PRs in order", flush=True)
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
     sequence_done = time.monotonic()
@@ -717,10 +741,7 @@ def cmd_build(cfg, args):
             try:
                 result = fut.result()
             except Exception as exc:  # one broken job must not discard hours of other results
-                error = f"{type(exc).__name__}: {exc}"
-                result = {"swap": {"blockers": [], "outcome": "error", "message": error},
-                          "culprit": {"error": error},
-                          "probe": {"probe": n[0], "target": n[1], "outcome": "error", "message": error}}[kind]
+                result = job_error(kind, n, exc)
             if kind == "swap":
                 swaps[str(n)] = result
             elif kind == "culprit":
