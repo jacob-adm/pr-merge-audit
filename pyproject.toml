@@ -17,7 +17,7 @@ classifiers = [
 ]
 
 [project.scripts]
-pr-merge-audit = "audit:main"
+pr-merge-audit = "pr_merge_audit:main"
 
 [tool.setuptools]
-py-modules = ["audit"]
+py-modules = ["pr_merge_audit"]
