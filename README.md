@@ -51,7 +51,7 @@ Paths are relative to the current directory, so run it from wherever you keep th
 snapshots and results. `report` and `verify` need no configuration.
 
 `snapshot` writes `snapshots/DATE.json` (PR numbers, titles, head commits, changed files,
-required-status state, linked issues) and `snapshots/DATE.bundle` (every commit involved), so a
+draft flag, required-status state) and `snapshots/DATE.bundle` (every commit involved), so a
 build can be re-run later even after PR branches move or are deleted.
 
 ## Procedure
