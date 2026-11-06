@@ -572,6 +572,18 @@ class HostileTrees(TreeFixture, unittest.TestCase):
         res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
         self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(no tests ran)"]))
 
+    def test_home_and_temp_directories_are_private_on_every_platform(self):
+        real_home, real_tmp = os.path.expanduser("~"), tempfile.gettempdir()
+        check = ("import os, tempfile, unittest\n"
+                 "class T(unittest.TestCase):\n"
+                 "    def test_private(self):\n"
+                 f"        self.assertNotEqual(os.path.expanduser('~'), {real_home!r})\n"
+                 f"        self.assertNotEqual(tempfile.gettempdir(), {real_tmp!r})\n")
+        ws, head = self.workspace(self.pr_tree({"test_private.py": check}))
+        wt = ws.tree("t", head)
+        res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(res["outcome"], "pass", res.get("failures"))
+
     def test_background_processes_are_stopped(self):
         pidfile = self.tmp / "pid"
         start = ("import subprocess, sys, unittest\n"
@@ -585,14 +597,24 @@ class HostileTrees(TreeFixture, unittest.TestCase):
                          "pass")
         pid = int(pidfile.read_text())
         for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not alive(pid):
                 break
             time.sleep(0.05)
         else:
             os.kill(pid, 9)
             self.fail("background process outlived the test run")
+
+
+def alive(pid):
+    """Whether process `pid` still runs. On Windows os.kill(pid, 0) would terminate it, so ask tasklist."""
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 class Unsupported(TreeFixture, unittest.TestCase):

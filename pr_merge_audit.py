@@ -54,7 +54,7 @@ TEST_ENV = {
 MARKER = ".audit-workspace"
 MIN_GIT = (2, 38)
 OUTPUT_CAP = 4 * 1024 * 1024
-PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+PASS_ENV = ("PATH", "SYSTEMROOT", "PATHEXT", "COMSPEC", "SYSTEMDRIVE", "WINDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
 
 
@@ -100,6 +100,33 @@ def fill(args, **values):
 def base_env():
     """Only the variables a subprocess needs, so the caller's GIT_*, tokens and the like stay out."""
     return {k: os.environ[k] for k in PASS_ENV if k in os.environ}
+
+
+def windows_job(proc):
+    """Put `proc` in a Windows job object, so its whole process tree can be stopped later,
+    including children whose parent has already exited. Returns None if that is not possible."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    job = k32.CreateJobObjectW(None, None)
+    if job and k32.AssignProcessToJobObject(job, int(proc._handle)):
+        return job
+    if job:
+        k32.CloseHandle(wintypes.HANDLE(job))
+    return None
+
+
+def stop_windows_job(job):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.TerminateJobObject(job, 1)
+    k32.CloseHandle(job)
 
 
 def git(repo, *args, check=True, binary=False):
@@ -450,12 +477,16 @@ class Workspace:
         env = dict(base_env(), **TEST_ENV)
         env.update({k: os.environ[k] for k in self.cfg.get("pass_env", []) if k in os.environ})
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"))
+        if os.name == "nt":  # where Windows programs look for the home and temp directories
+            home, tmp = str(scratch / "home"), str(scratch / "tmp")
+            env.update(USERPROFILE=home, APPDATA=home, LOCALAPPDATA=home, TEMP=tmp, TMP=tmp)
         env.update(self.cfg.get("env", {}))
         log = scratch / "output.log"
         posix = hasattr(os, "killpg")
         with open(log, "wb") as f:
             proc = subprocess.Popen(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
                                     start_new_session=posix)
+            job = None if posix else windows_job(proc)
             try:
                 rc = proc.wait(timeout=self.cfg["test_timeout"])
             except subprocess.TimeoutExpired:
@@ -467,6 +498,8 @@ class Workspace:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
+                elif job:
+                    stop_windows_job(job)
                 else:
                     proc.kill()
                 proc.wait()
