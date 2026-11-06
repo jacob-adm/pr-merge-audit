@@ -14,6 +14,9 @@ file kept with that project, not here. `config.example.json` is a starting point
 
 - Python 3.8 or later, standard library only
 - git 2.38 or later (`git merge-tree --write-tree`)
+- Linux, macOS or Windows. Each test run gets a private home and temp directory, and the tool
+  stops every process the run started when it ends (a process group on Linux and macOS, a job
+  object on Windows). The target project's own test command must of course run on that platform.
 - For `snapshot` only: GitHub (github.com, or GitHub Enterprise through `api`). Optional:
   `GITHUB_TOKEN` in the environment (unauthenticated API access is rate-limited).
 

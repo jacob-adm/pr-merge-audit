@@ -325,6 +325,28 @@ class Packaging(unittest.TestCase):
         self.assertIn('pr-merge-audit = "pr_merge_audit:main"', pyproject)
 
 
+class Portability(unittest.TestCase):
+    def test_archive_paths_absolute_on_any_platform_are_refused(self):
+        for name in ("/etc/x", "\\x", "C:x", "C:\\x", "\\\\host\\share\\x"):
+            self.assertTrue(audit.absolute(name), name)
+        self.assertFalse(audit.absolute("a/b"))
+
+    def test_read_only_files_are_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "t"
+            (tree / "objects").mkdir(parents=True)
+            (tree / "objects" / "pack").write_text("x")
+            os.chmod(tree / "objects" / "pack", 0o444)
+            audit.remove_tree(tree, strict=True)
+            self.assertFalse(tree.exists())
+
+    def test_written_files_are_utf8_with_lf_line_ends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.md"
+            audit.write_text(out, "caf\u00e9 \u2713\n")
+            self.assertEqual(out.read_bytes(), "caf\u00e9 \u2713\n".encode("utf-8"))
+
+
 class JobErrors(unittest.TestCase):
     def test_every_kind_of_failed_job_is_recorded(self):
         exc = RuntimeError("boom")
@@ -494,8 +516,9 @@ class Containment(unittest.TestCase):
 
 def git_in(repo, *argv, data=None):
     env = dict(os.environ, **audit.GIT_ENV)
-    return subprocess.run(["git", *argv], cwd=repo, env=env, input=data, check=True,
-                          capture_output=True, text=True).stdout.strip()
+    # bytes, not text: in text mode Windows would turn each "\n" of `data` into "\r\n"
+    return subprocess.run(["git", *argv], cwd=repo, env=env, input=None if data is None else data.encode(),
+                          check=True, capture_output=True).stdout.decode().strip()
 
 
 def mktree(repo, entries):
@@ -572,6 +595,18 @@ class HostileTrees(TreeFixture, unittest.TestCase):
         res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
         self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(no tests ran)"]))
 
+    def test_home_and_temp_directories_are_private_on_every_platform(self):
+        real_home, real_tmp = os.path.expanduser("~"), tempfile.gettempdir()
+        check = ("import os, tempfile, unittest\n"
+                 "class T(unittest.TestCase):\n"
+                 "    def test_private(self):\n"
+                 f"        self.assertNotEqual(os.path.expanduser('~'), {real_home!r})\n"
+                 f"        self.assertNotEqual(tempfile.gettempdir(), {real_tmp!r})\n")
+        ws, head = self.workspace(self.pr_tree({"test_private.py": check}))
+        wt = ws.tree("t", head)
+        res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(res["outcome"], "pass", res.get("failures"))
+
     def test_background_processes_are_stopped(self):
         pidfile = self.tmp / "pid"
         start = ("import subprocess, sys, unittest\n"
@@ -585,14 +620,24 @@ class HostileTrees(TreeFixture, unittest.TestCase):
                          "pass")
         pid = int(pidfile.read_text())
         for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not alive(pid):
                 break
             time.sleep(0.05)
         else:
             os.kill(pid, 9)
             self.fail("background process outlived the test run")
+
+
+def alive(pid):
+    """Whether process `pid` still runs. On Windows os.kill(pid, 0) would terminate it, so ask tasklist."""
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 class Unsupported(TreeFixture, unittest.TestCase):

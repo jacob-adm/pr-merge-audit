@@ -21,6 +21,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -31,7 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "audit",
@@ -54,12 +55,12 @@ TEST_ENV = {
 MARKER = ".audit-workspace"
 MIN_GIT = (2, 38)
 OUTPUT_CAP = 4 * 1024 * 1024
-PASS_ENV = ("PATH", "SYSTEMROOT", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+PASS_ENV = ("PATH", "SYSTEMROOT", "PATHEXT", "COMSPEC", "SYSTEMDRIVE", "WINDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
 
 
 def load_config(path):
-    cfg = json.loads(Path(path).read_text())
+    cfg = json.loads(Path(path).read_text(encoding="utf-8"))
     if not cfg.get("test_cmd"):
         sys.exit(f"{path}: test_cmd is required")
     for probe in cfg.get("probes", []):
@@ -92,7 +93,7 @@ def fill(args, **values):
     out = []
     for a in args:
         for k, v in values.items():
-            a = a.replace("{" + k + "}", str(v))
+            a = a.replace("{" + k + "}", v.as_posix() if isinstance(v, Path) else str(v))
         out.append(a)
     return out
 
@@ -102,11 +103,59 @@ def base_env():
     return {k: os.environ[k] for k in PASS_ENV if k in os.environ}
 
 
+def windows_job(proc):
+    """Put `proc` in a Windows job object, so its whole process tree can be stopped later,
+    including children whose parent has already exited. Returns None if that is not possible."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    job = k32.CreateJobObjectW(None, None)
+    if job and k32.AssignProcessToJobObject(job, int(proc._handle)):
+        return job
+    if job:
+        k32.CloseHandle(wintypes.HANDLE(job))
+    return None
+
+
+def stop_windows_job(job):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.TerminateJobObject(job, 1)
+    k32.CloseHandle(job)
+
+
+def write_text(path, text):
+    """Write UTF-8 with LF line ends on every platform, so results and reports are identical."""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def remove_tree(path, strict=False):
+    """Delete a directory tree. Windows refuses to delete read-only files, which git creates
+    for its objects, so those are made writable and tried again."""
+    def retry(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    hook = {"onexc": retry} if sys.version_info >= (3, 12) else {"onerror": retry}
+    try:
+        shutil.rmtree(path, **hook)
+    except OSError:
+        if strict:
+            raise
+
+
 def git(repo, *args, check=True, binary=False):
     env = dict(base_env(), **GIT_ENV)
     # gc.auto=0: parallel jobs merge in worktrees of one repository; a background gc must not race them.
     argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "gc.auto=0", *args]
-    r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=not binary)
+    text = {} if binary else {"encoding": "utf-8", "errors": "replace"}  # not the locale's code page
+    r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, **text)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
     return r
@@ -200,7 +249,7 @@ def cmd_snapshot(cfg, args):
         cache.parent.mkdir(parents=True, exist_ok=True)
         git(".", "init", "-q", "--bare", str(cache))
     stale = git(cache, "for-each-ref", "--format=delete %(refname)", "refs/audit").stdout
-    subprocess.run(["git", "update-ref", "--stdin"], cwd=cache, input=stale, text=True, check=True,
+    subprocess.run(["git", "update-ref", "--stdin"], cwd=cache, input=stale.encode(), check=True,
                    env=dict(base_env(), **GIT_ENV))
     specs = [f"+refs/heads/{cfg['base']}:refs/audit/base"]
     specs += [f"+refs/pull/{p['number']}/head:refs/audit/pr/{p['number']}" for p in pulls]
@@ -220,7 +269,7 @@ def cmd_snapshot(cfg, args):
             "files": sorted(files),
         })
     snap = {"date": date, "repo": cfg["repo"], "base_ref": cfg["base"], "base_sha": base_sha, "prs": prs}
-    (out / f"{date}.json").write_text(json.dumps(snap, indent=1, sort_keys=True) + "\n")
+    write_text(out / f"{date}.json", json.dumps(snap, indent=1, sort_keys=True) + "\n")
     git(cache, "bundle", "create", "-q", str((out / f"{date}.bundle").resolve()), "--glob=refs/audit")
     print(f"{out / date}.json: {len(prs)} open PRs against {cfg['base']} {base_sha[:7]}")
 
@@ -232,14 +281,20 @@ def names(z):
     return [x for x in z.split("\0") if x]
 
 
+def absolute(name):
+    """Whether an archive path is absolute on any platform: `/x`, `\\x`, `C:x` and `\\\\host\\x` all are.
+    (`os.path.isabs` alone is not enough: on Windows with Python 3.13 it says no to `/x`.)"""
+    return name.startswith(("/", "\\")) or bool(PureWindowsPath(name).drive) or os.path.isabs(name)
+
+
 def safe_member(root, m):
     """Whether a tar member from `git archive` can be written under `root` without escaping it."""
     parts = Path(m.name).parts
-    if os.path.isabs(m.name) or ".." in parts or not (m.isfile() or m.isdir() or m.issym()):
+    if absolute(m.name) or ".." in parts or not (m.isfile() or m.isdir() or m.issym()):
         return False
     if m.issym():
         target = os.path.normpath(os.path.join(os.path.dirname(m.name), m.linkname))
-        if os.path.isabs(m.linkname) or target == ".." or target.startswith(".." + os.sep):
+        if absolute(m.linkname) or target == ".." or target.startswith(".." + os.sep):
             return False
     parent = root
     for part in parts[:-1]:
@@ -352,14 +407,14 @@ class Workspace:
         if self.work.exists() and any(self.work.iterdir()):
             if not (self.work / MARKER).is_file():
                 sys.exit(f"refusing to clear {self.work}: no {MARKER} marker, so not a build directory")
-            shutil.rmtree(self.work)
+            remove_tree(self.work, strict=True)
         self.repo.mkdir(parents=True)
-        (self.work / MARKER).write_text("created by pr_merge_audit.py; deleted and recreated on each build\n")
+        write_text(self.work / MARKER, "created by pr_merge_audit.py; deleted and recreated on each build\n")
         git(self.repo, "init", "-q")
         # Overrides each commit's own .gitattributes, so a PR cannot drop files from the test copy.
         info = self.repo / ".git" / "info"
         info.mkdir(exist_ok=True)
-        (info / "attributes").write_text("* -export-ignore -export-subst\n")
+        write_text(info / "attributes", "* -export-ignore -export-subst\n")
         git(self.repo, "fetch", "-q", str(Path(bundle).resolve()), "+refs/audit/*:refs/audit/*")
         self.base = snap["base_sha"]
         self.heads = {p["number"]: p["head"] for p in snap["prs"]}
@@ -437,7 +492,7 @@ class Workspace:
                 raise RuntimeError(f"git archive {commit} failed")
             prune_links(root)
         except BaseException:
-            shutil.rmtree(scratch, ignore_errors=True)
+            remove_tree(scratch)
             raise
         return scratch, root
 
@@ -450,12 +505,16 @@ class Workspace:
         env = dict(base_env(), **TEST_ENV)
         env.update({k: os.environ[k] for k in self.cfg.get("pass_env", []) if k in os.environ})
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"))
+        if os.name == "nt":  # where Windows programs look for the home and temp directories
+            home, tmp = str(scratch / "home"), str(scratch / "tmp")
+            env.update(USERPROFILE=home, APPDATA=home, LOCALAPPDATA=home, TEMP=tmp, TMP=tmp)
         env.update(self.cfg.get("env", {}))
         log = scratch / "output.log"
         posix = hasattr(os, "killpg")
         with open(log, "wb") as f:
             proc = subprocess.Popen(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
                                     start_new_session=posix)
+            job = None if posix else windows_job(proc)
             try:
                 rc = proc.wait(timeout=self.cfg["test_timeout"])
             except subprocess.TimeoutExpired:
@@ -467,6 +526,8 @@ class Workspace:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
+                elif job:
+                    stop_windows_job(job)
                 else:
                     proc.kill()
                 proc.wait()
@@ -499,7 +560,7 @@ class Workspace:
         try:
             rc, out, setup_failed = self.execute(scratch, root, argv)
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            remove_tree(scratch)
         if setup_failed:
             return setup_failure(rc, out)
         if rc is None:
@@ -644,7 +705,7 @@ def run_probe(ws, probe, target):
         ws.count()
         rc, out, setup_failed = ws.execute(scratch, root, argv)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        remove_tree(scratch)
     if setup_failed:
         return dict(row, outcome="fail", message=setup_failure(rc, out)["message"])
     if rc is None:
@@ -686,7 +747,7 @@ def timing_summary(wall, seconds):
 
 def cmd_build(cfg, args):
     check_git()
-    snap = json.loads(Path(args.snapshot).read_text())
+    snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
     check_probes(cfg, snap)
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     print("note: this runs code from every PR it tries; use a disposable machine without credentials",
@@ -699,7 +760,7 @@ def cmd_build(cfg, args):
     ws = Workspace(cfg, snap, bundle, args.work)
     missing = " and ".join(ws.incomplete_checkout(ws.base))
     if missing and not cfg.get("allow_incomplete_checkout"):
-        shutil.rmtree(ws.work, ignore_errors=True)
+        remove_tree(ws.work)
         sys.exit(f"the base {snap['base_sha'][:7]} uses {missing}, which test runs would not contain; "
                  f"set allow_incomplete_checkout to run anyway")
     if missing:
@@ -708,7 +769,7 @@ def cmd_build(cfg, args):
     lacking = {n: ws.incomplete_checkout(ws.heads[n]) for n in seq}
     lacking = ", ".join(f"#{n} ({' and '.join(m)})" for n, m in lacking.items() if m)
     if lacking and not cfg.get("allow_incomplete_checkout"):
-        shutil.rmtree(ws.work, ignore_errors=True)
+        remove_tree(ws.work)
         sys.exit(f"PRs {lacking} add content test runs would not contain; "
                  f"set allow_incomplete_checkout to run anyway")
     if lacking:
@@ -717,7 +778,7 @@ def cmd_build(cfg, args):
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
     sequence_done = time.monotonic()
     if base_result["outcome"] not in ("pass", "flaky"):
-        shutil.rmtree(ws.work, ignore_errors=True)
+        remove_tree(ws.work)
         detail = ", ".join(base_result.get("failures", [])) + (": " + base_result["message"] if base_result.get("message") else "")
         sys.exit(f"tests fail on the base {snap['base_sha'][:7]} before any PR is merged ({detail}); "
                  f"fix the test environment or test_cmd first")
@@ -777,8 +838,8 @@ def cmd_build(cfg, args):
     }
     out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
-    shutil.rmtree(ws.work, ignore_errors=True)
+    write_text(out, json.dumps(results, indent=1, sort_keys=True) + "\n")
+    remove_tree(ws.work)
     print(f"wrote {out}")
 
 
@@ -986,21 +1047,21 @@ def render(cfg, res):
 
 
 def cmd_report(cfg, args):
-    res = json.loads(Path(args.results).read_text())
+    res = json.loads(Path(args.results).read_text(encoding="utf-8"))
     text = render(cfg, res)
     if args.out:
-        Path(args.out).write_text(text)
+        write_text(Path(args.out), text)
     else:
         sys.stdout.write(text)
 
 
 def cmd_verify(cfg, args):
-    res = json.loads(Path(args.results).read_text())
-    a, b = render(cfg, res), render(cfg, json.loads(Path(args.results).read_text()))
+    res = json.loads(Path(args.results).read_text(encoding="utf-8"))
+    a, b = render(cfg, res), render(cfg, json.loads(Path(args.results).read_text(encoding="utf-8")))
     if a != b:
         sys.exit("FAIL: two renders of the same results differ")
     if args.golden:
-        want = Path(args.golden).read_text()
+        want = Path(args.golden).read_text(encoding="utf-8")
         if a != want:
             import difflib
             sys.stdout.writelines(difflib.unified_diff(want.splitlines(True), a.splitlines(True), "golden", "rendered"))
@@ -1010,8 +1071,8 @@ def cmd_verify(cfg, args):
 
 def cmd_estimate(cfg, args):
     """Time one test-suite run here and scale it by the run counts of a reference build."""
-    snap = json.loads(Path(args.snapshot).read_text())
-    ref = json.loads(Path(args.reference).read_text())
+    snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+    ref = json.loads(Path(args.reference).read_text(encoding="utf-8"))
     runs = ref.get("test_runs")
     if not runs:
         sys.exit(f"{args.reference} has no test_runs counts; use results from a newer build")
@@ -1024,7 +1085,7 @@ def cmd_estimate(cfg, args):
     ws.test_once(wt, argv)
     one = time.monotonic() - start
     ws.drop(wt)
-    shutil.rmtree(ws.work, ignore_errors=True)
+    remove_tree(ws.work)
     scale = len(classify(cfg, snap)[0]) / max(1, len(ref["order"]))
     seq = runs["sequence"] * scale * one
     rest = (runs["swap"] + runs["culprit"] + runs["probe"]) * scale * one / max(1, cfg["workers"])
@@ -1036,6 +1097,9 @@ def cmd_estimate(cfg, args):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a PR title the console's code page lacks must not crash
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="config.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
