@@ -229,6 +229,11 @@ python3 pr_merge_audit.py verify --results tests/golden/results.json --golden te
 which renders the report twice and compares both renders with the golden copy byte for byte.
 After a deliberate change to the report, rebuild the fixture and replace both files.
 
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how the project is developed and what is enforced,
+and [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
+
 ## License
 
 Apache License 2.0; see `LICENSE`.

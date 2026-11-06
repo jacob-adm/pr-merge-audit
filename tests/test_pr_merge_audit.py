@@ -347,6 +347,16 @@ class Portability(unittest.TestCase):
             self.assertEqual(out.read_bytes(), "caf\u00e9 \u2713\n".encode("utf-8"))
 
 
+class ProcessDocs(unittest.TestCase):
+    def test_contributing_claims_match_the_ci_workflow(self):
+        """CONTRIBUTING.md says CI covers Linux and Windows on Python 3.8 and 3.13; keep that true."""
+        doc = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        ci = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+        self.assertIn("Linux and Windows, Python 3.8 and 3.13", doc)
+        for needle in ("ubuntu-", "windows-", '"3.8"', '"3.13"'):
+            self.assertIn(needle, ci)
+
+
 class JobErrors(unittest.TestCase):
     def test_every_kind_of_failed_job_is_recorded(self):
         exc = RuntimeError("boom")
