@@ -33,17 +33,17 @@ pip install git+https://github.com/jacob-adm/pr-merge-audit
 pr-merge-audit --help
 ```
 
-or run `python3 audit.py` from a clone; it has no dependencies. The commands below use
-`python3 audit.py`; `pr-merge-audit` takes the same arguments.
+or run `python3 pr_merge_audit.py` from a clone; it has no dependencies. The commands below use
+`python3 pr_merge_audit.py`; `pr-merge-audit` takes the same arguments.
 
 ## Usage
 
 ```
-python3 audit.py --config PROJECT/config.json snapshot   # freeze PR heads and metadata
-python3 audit.py --config PROJECT/config.json build --snapshot snapshots/DATE.json   # offline
-python3 audit.py report --results results/DATE.json --out reports/DATE.md
-python3 audit.py verify --results results/DATE.json --golden reports/DATE.md
-python3 audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json \
+python3 pr_merge_audit.py --config PROJECT/config.json snapshot   # freeze PR heads and metadata
+python3 pr_merge_audit.py --config PROJECT/config.json build --snapshot snapshots/DATE.json   # offline
+python3 pr_merge_audit.py report --results results/DATE.json --out reports/DATE.md
+python3 pr_merge_audit.py verify --results results/DATE.json --golden reports/DATE.md
+python3 pr_merge_audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json \
     --reference results/EARLIER.json                     # rough running time on this machine
 ```
 
@@ -131,7 +131,7 @@ running time on your machine, time one test-suite run here and scale it by the c
 reference build of the same project:
 
 ```
-python3 audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json --reference results/EARLIER.json
+python3 pr_merge_audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json --reference results/EARLIER.json
 ```
 
 The estimate uses the counts in the reference results, scaled by how many PRs the new snapshot
@@ -144,8 +144,8 @@ and of the follow-ups.
 
 ### A measured build
 
-One full build of a Python project with 111 open PRs, on an Apple M4 Pro (14 cores,
-macOS 26) with `workers: 4`. The tool tried 76 PRs. 53 merged, 18 conflicted and 5 failed.
+One full build of a Python project with 111 open PRs, on a 14-core laptop
+with `workers: 4`. The tool tried 76 PRs. 53 merged, 18 conflicted and 5 failed.
 The suite grew from 70 tests on the base to 248 after the last merge.
 
 | Phase | Runs | Median run | Longest run |
@@ -207,7 +207,7 @@ Targets are `"base"` or PR numbers. Probe output is read with the same patterns 
 python3 -m unittest discover -s tests
 ```
 
-`tests/test_audit.py` builds small git repositories in temporary directories and runs the real
+`tests/test_pr_merge_audit.py` builds small git repositories in temporary directories and runs the real
 tool on them (no mocks): merge, conflict and swap, a cross-PR test failure found by bisection, a
 PR that fails on the base alone, the not-tried reasons, probes, run counts, determinism across
 two builds, test isolation from `.git`, archive and probe containment, hidden and early-exiting
@@ -216,11 +216,11 @@ token handling on redirects. It also checks the golden report. The suite takes a
 
 ## Self-check
 
-`tests/golden/` holds the results of a build of the test fixture in `tests/test_audit.py` and
+`tests/golden/` holds the results of a build of the test fixture in `tests/test_pr_merge_audit.py` and
 the report they render to. Rendering is checked with:
 
 ```
-python3 audit.py verify --results tests/golden/results.json --golden tests/golden/report.md
+python3 pr_merge_audit.py verify --results tests/golden/results.json --golden tests/golden/report.md
 ```
 
 which renders the report twice and compares both renders with the golden copy byte for byte.

@@ -3,10 +3,10 @@
 
 Needs only the Python standard library (3.8+) and git (2.38+, for `git merge-tree --write-tree`).
 
-    audit.py --config config.json snapshot                                # network: freeze PR heads
-    audit.py --config config.json build --snapshot snapshots/DATE.json    # offline; runs PR code
-    audit.py report --results results/DATE.json [--out report.md]
-    audit.py verify --results results/DATE.json --golden report.md
+    pr_merge_audit.py --config config.json snapshot                                # network: freeze PR heads
+    pr_merge_audit.py --config config.json build --snapshot snapshots/DATE.json    # offline; runs PR code
+    pr_merge_audit.py report --results results/DATE.json [--out report.md]
+    pr_merge_audit.py verify --results results/DATE.json --golden report.md
 
 Only `snapshot` uses the network (a GitHub-compatible API). The same snapshot, config and machine
 give the same report.
@@ -354,7 +354,7 @@ class Workspace:
                 sys.exit(f"refusing to clear {self.work}: no {MARKER} marker, so not a build directory")
             shutil.rmtree(self.work)
         self.repo.mkdir(parents=True)
-        (self.work / MARKER).write_text("created by audit.py; deleted and recreated on each build\n")
+        (self.work / MARKER).write_text("created by pr_merge_audit.py; deleted and recreated on each build\n")
         git(self.repo, "init", "-q")
         # Overrides each commit's own .gitattributes, so a PR cannot drop files from the test copy.
         info = self.repo / ".git" / "info"

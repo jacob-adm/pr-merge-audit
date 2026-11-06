@@ -1,4 +1,4 @@
-"""Tests for audit.py. Real git repositories in temporary directories; nothing is mocked."""
+"""Tests for pr_merge_audit.py. Real git repositories in temporary directories; nothing is mocked."""
 
 import argparse
 import http.server
@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-import audit  # noqa: E402
+import pr_merge_audit as audit  # noqa: E402
 
 GOLDEN = ROOT / "tests" / "golden"
 
@@ -314,6 +314,15 @@ class SmallBuilds(unittest.TestCase):
         self.assertEqual(res["merged"], [1])
         self.assertEqual([(p["target"], p["outcome"]) for p in res["probes"]], [("base", "pass"), (2, "error")])
         self.assertTrue(res["probes"][1]["message"])
+
+
+class Packaging(unittest.TestCase):
+    def test_installed_module_and_console_script_use_the_distinctive_name(self):
+        """A generic top-level module such as `audit` would collide with other installed packages."""
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        self.assertEqual(audit.__name__, "pr_merge_audit")
+        self.assertIn('py-modules = ["pr_merge_audit"]', pyproject)
+        self.assertIn('pr-merge-audit = "pr_merge_audit:main"', pyproject)
 
 
 class JobErrors(unittest.TestCase):
