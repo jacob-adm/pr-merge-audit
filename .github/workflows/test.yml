@@ -12,8 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS runners are left out while the repository is private.
-        os: [ubuntu-22.04, windows-2022]
+        os: [ubuntu-22.04, macos-15, windows-2022]
         python: ["3.8", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:

@@ -349,11 +349,11 @@ class Portability(unittest.TestCase):
 
 class ProcessDocs(unittest.TestCase):
     def test_contributing_claims_match_the_ci_workflow(self):
-        """CONTRIBUTING.md says CI covers Linux and Windows on Python 3.8 and 3.13; keep that true."""
+        """CONTRIBUTING.md says CI covers Linux, macOS and Windows on Python 3.8 and 3.13; keep that true."""
         doc = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
         ci = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
-        self.assertIn("Linux and Windows, Python 3.8 and 3.13", doc)
-        for needle in ("ubuntu-", "windows-", '"3.8"', '"3.13"'):
+        self.assertIn("Linux, macOS and Windows, Python 3.8 and 3.13", doc)
+        for needle in ("ubuntu-", "macos-", "windows-", '"3.8"', '"3.13"'):
             self.assertIn(needle, ci)
 
 
