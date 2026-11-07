@@ -1,4 +1,13 @@
-"""Tests for pr_merge_audit.py. Real git repositories in temporary directories; nothing is mocked."""
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The pr-merge-audit Authors
+#
+# Test suite for pr_merge_audit.py. Run with: python3 -m unittest discover -s tests
+
+"""Tests for pr_merge_audit.py. Real git repositories in temporary directories; nothing is mocked.
+
+Fixtures build small repositories with known PRs, bundle them like a real snapshot, and run the
+actual build, export and report code paths, so each test exercises the behaviour users depend on.
+"""
 
 import argparse
 import http.server
@@ -14,19 +23,23 @@ import time
 import unittest
 from pathlib import Path
 
+# Import the module from the repository root, so the tests run against the working copy.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import pr_merge_audit as audit  # noqa: E402
 
+# Reference results and report for the end-to-end fixture; see `verify`.
 GOLDEN = ROOT / "tests" / "golden"
 
 
 def sh(cwd, *argv):
+    """Run a command in `cwd` with the tool's fixed git identity; return stripped stdout."""
     env = dict(os.environ, **audit.GIT_ENV)
     return subprocess.run(argv, cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def commit(repo, files, message, remove=()):
+    """Write `files`, remove paths in `remove`, commit everything and return the commit id."""
     for rel in remove:
         sh(repo, "git", "rm", "-rq", rel)
     for rel, text in files.items():
@@ -39,6 +52,7 @@ def commit(repo, files, message, remove=()):
 
 
 def branch(repo, name, files, remove=()):
+    """Commit `files` on a new branch `name` off main, return to main and return the head commit."""
     sh(repo, "git", "checkout", "-q", "-b", name, "main")
     head = commit(repo, files, name, remove)
     sh(repo, "git", "checkout", "-q", "main")
@@ -117,6 +131,7 @@ def make_project(tmp):
 
 
 def build(cfg, snap, bundle, tmp, name, ignore_status=False):
+    """Run the real `build` command on a fixture and return the parsed results file."""
     out = tmp / f"{name}.json"
     args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), work=str(tmp / f"work-{name}"), out=str(out),
                               ignore_status=ignore_status)
@@ -125,6 +140,7 @@ def build(cfg, snap, bundle, tmp, name, ignore_status=False):
 
 
 class BuildEndToEnd(unittest.TestCase):
+    """One full build of a fixture with merges, conflicts, failures and probes, checked end to end."""
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
@@ -210,6 +226,7 @@ PASSING = "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): 
 
 
 class SmallBuilds(unittest.TestCase):
+    """Single-PR builds that exercise one rule or stop condition each."""
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
@@ -317,6 +334,7 @@ class SmallBuilds(unittest.TestCase):
 
 
 class Packaging(unittest.TestCase):
+    """Installation metadata stays consistent with the module."""
     def test_installed_module_and_console_script_use_the_distinctive_name(self):
         """A generic top-level module such as `audit` would collide with other installed packages."""
         pyproject = (ROOT / "pyproject.toml").read_text()
@@ -324,8 +342,24 @@ class Packaging(unittest.TestCase):
         self.assertIn('py-modules = ["pr_merge_audit"]', pyproject)
         self.assertIn('pr-merge-audit = "pr_merge_audit:main"', pyproject)
 
+    def test_version_matches_the_package_metadata(self):
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn(f'version = "{audit.__version__}"', pyproject)
+
+    def test_source_files_carry_a_license_header_and_documented_functions(self):
+        """Every Python file starts with an SPDX header; every function and class in the tool has a docstring."""
+        import ast
+        for path in [ROOT / "pr_merge_audit.py", *sorted((ROOT / "tests").glob("*.py"))]:
+            head = path.read_text(encoding="utf-8").splitlines()[:3]
+            self.assertIn("# SPDX-License-Identifier: Apache-2.0", head, path.name)
+        tree = ast.parse((ROOT / "pr_merge_audit.py").read_text(encoding="utf-8"))
+        undocumented = [n.name for n in ast.walk(tree)
+                        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and not ast.get_docstring(n)]
+        self.assertEqual(undocumented, [])
+
 
 class Portability(unittest.TestCase):
+    """Behaviour that must hold identically on Linux, macOS and Windows."""
     def test_archive_paths_absolute_on_any_platform_are_refused(self):
         for name in ("/etc/x", "\\x", "C:x", "C:\\x", "\\\\host\\share\\x"):
             self.assertTrue(audit.absolute(name), name)
@@ -348,6 +382,7 @@ class Portability(unittest.TestCase):
 
 
 class ProcessDocs(unittest.TestCase):
+    """Claims in the contributor documentation stay true."""
     def test_contributing_claims_match_the_ci_workflow(self):
         """CONTRIBUTING.md says CI covers Linux, macOS and Windows on Python 3.8 and 3.13; keep that true."""
         doc = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
@@ -358,6 +393,7 @@ class ProcessDocs(unittest.TestCase):
 
 
 class JobErrors(unittest.TestCase):
+    """Failed follow-up jobs are recorded without losing other results; timing statistics are correct."""
     def test_every_kind_of_failed_job_is_recorded(self):
         exc = RuntimeError("boom")
         self.assertEqual(audit.job_error("swap", 5, exc), {"blockers": [], "outcome": "error", "message": "RuntimeError: boom"})
@@ -369,7 +405,9 @@ class JobErrors(unittest.TestCase):
 
 
 class Classify(unittest.TestCase):
+    """Which PRs are tried, in what order, and why the others are not."""
     def cfg(self, **kw):
+        """Minimal configuration for classification, with overrides from `kw`."""
         cfg = {"test_prefix": "tests/", "order": [], "exclude": {}, "duplicates": {}, "features": {},
                "no_tests_ok": set(), "required_status": "ci"}
         cfg.update(kw)
@@ -377,6 +415,7 @@ class Classify(unittest.TestCase):
         return cfg
 
     def snap(self, *prs):
+        """Snapshot of PRs given as (number, overrides) pairs; defaults to ready PRs that change tests."""
         return {"prs": [dict({"draft": False, "status": "SUCCESS", "files": ["tests/t.py"]}, number=n, **kw)
                         for n, kw in prs]}
 
@@ -400,6 +439,7 @@ class Classify(unittest.TestCase):
 
 
 class Helpers(unittest.TestCase):
+    """Small pure functions: placeholder filling, output scanning, Markdown escaping."""
     def test_git_version(self):
         self.assertEqual(audit.git_version("git version 2.50.1 (Apple Git-155)"), (2, 50))
         self.assertEqual(audit.git_version("git version 2.45.1.windows.1"), (2, 45))
@@ -466,6 +506,7 @@ class Helpers(unittest.TestCase):
 
 
 class Containment(unittest.TestCase):
+    """Archive members that could write outside the export directory are refused."""
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
@@ -478,6 +519,7 @@ class Containment(unittest.TestCase):
         self._tmp.cleanup()
 
     def member(self, name, kind=tarfile.REGTYPE, link=""):
+        """A tar member of the given type, as `git archive` would produce."""
         m = tarfile.TarInfo(name)
         m.type, m.linkname = kind, link
         return m
@@ -525,6 +567,7 @@ class Containment(unittest.TestCase):
 
 
 def git_in(repo, *argv, data=None):
+    """Run git in `repo`, optionally feeding `data` on stdin; return stripped stdout."""
     env = dict(os.environ, **audit.GIT_ENV)
     # bytes, not text: in text mode Windows would turn each "\n" of `data` into "\r\n"
     return subprocess.run(["git", *argv], cwd=repo, env=env, input=None if data is None else data.encode(),
@@ -557,6 +600,7 @@ class TreeFixture:
         self._tmp.cleanup()
 
     def workspace(self, tree, **cfg):
+        """Commit `tree`, bundle it as a snapshot base and open it as a Workspace."""
         head = git_in(self.src, "commit-tree", tree, "-m", "pr")
         git_in(self.src, "update-ref", "refs/audit/base", head)
         bundle = self.tmp / "b.bundle"
@@ -565,6 +609,7 @@ class TreeFixture:
         return audit.Workspace(cfg, {"base_sha": head, "prs": []}, bundle, self.tmp / "work"), head
 
     def pr_tree(self, files):
+        """Tree with `files` under `tests/`."""
         return mktree(self.src, [("040000", "tests", mktree(self.src, [("100644", k, v) for k, v in files.items()]))])
 
 
@@ -727,6 +772,7 @@ class Toolchain(TreeFixture, unittest.TestCase):
 
 
 class TokenRedirect(unittest.TestCase):
+    """The API token is never forwarded when a request is redirected to another host."""
     def test_token_not_sent_to_redirect_target(self):
         seen = {}
 
@@ -767,6 +813,7 @@ class TokenRedirect(unittest.TestCase):
 
 
 class RateLimit(unittest.TestCase):
+    """API errors end the run with an actionable message, including rate-limit reset times."""
     def test_rate_limit_exits_with_a_hint(self):
         class Limited(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
