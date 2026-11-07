@@ -60,6 +60,7 @@ def branch(repo, name, files, remove=()):
 
 
 # How the fixtures' tests are run and read; the tool itself assumes no test runner.
+# Output patterns for Python unittest, used by every fixture; any runner works with its own patterns.
 UNITTEST = {
     "test_cmd": ["{python}", "-m", "unittest", "discover", "-s", "tests"],
     "failure_pattern": r"^(?:FAIL|ERROR): (\S+) \(",
@@ -67,13 +68,16 @@ UNITTEST = {
     "skipped_pattern": r"skipped=(\d+)",
     "message_pattern": r"^\w*Error: (.+)$",
 }
+# Runs a single probe module with unittest.
 PROBE_CMD = ["{python}", "-m", "unittest", "{module}"]
 
+# The base test: app.add must add.
 TEST_ADD = "import unittest, app\nclass T(unittest.TestCase):\n    def test_add(self): self.assertEqual(app.add(1, 2), 3)\n"
 
 
 def make_project(tmp):
     """A small repository with PRs covering each outcome, plus its snapshot, bundle and config."""
+    # Base: an app, a helper module and one passing test.
     repo = tmp / "src"
     repo.mkdir()
     sh(repo, "git", "init", "-q", "-b", "main")
@@ -82,6 +86,7 @@ def make_project(tmp):
         "util.py": "def helper():\n    return 42\n",
         "tests/test_app.py": TEST_ADD,
     }, "base")
+    # Template for a trivially passing test file per PR.
     t = "import unittest\nclass T(unittest.TestCase):\n    def test_{0}(self): pass\n"
     heads = {
         # 1 and 2 change the same line: a text conflict.
@@ -99,17 +104,20 @@ def make_project(tmp):
                                "    def test_no_git(self):\n"
                                "        here = Path(os.getcwd())\n"
                                "        self.assertEqual([p for p in [here, *here.parents] if (p / '.git').exists()], [])\n"}),
+        # 6 is excluded by configuration; 7 fails its required check; 8 changes code without tests.
         6: branch(repo, "p6", {"tests/test_p6.py": t.format("p6")}),
         7: branch(repo, "p7", {"tests/test_p7.py": t.format("p7")}),
         8: branch(repo, "p8", {"app.py": "VERSION = 1\n\ndef add(a, b):\n    return b + a\n"}),
         # 9 breaks a test on the base by itself.
         9: branch(repo, "p9", {"app.py": "VERSION = 1\n\ndef add(a, b):\n    return a - b\n", "tests/test_p9.py": t.format("p9")}),
     }
+    # Publish the commits under the snapshot ref names and bundle them, as `snapshot` would.
     sh(repo, "git", "update-ref", "refs/audit/base", base)
     for n, head in heads.items():
         sh(repo, "git", "update-ref", f"refs/audit/pr/{n}", head)
     bundle = tmp / "snap.bundle"
     sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+    # Snapshot metadata for each PR, with changed files computed by git.
     prs = []
     for n, head in heads.items():
         files = audit.names(sh(repo, "git", "diff", "--name-only", "-z", f"{base}...{head}") + "\0")
@@ -118,9 +126,11 @@ def make_project(tmp):
     snap = tmp / "snap.json"
     snap.write_text(json.dumps({"date": "test", "repo": "local/test", "base_ref": "main",
                                 "base_sha": base, "prs": prs}))
+    # A probe that checks util.helper still exists.
     (tmp / "probe.py").write_text(
         "import unittest, util\nclass P(unittest.TestCase):\n"
         "    def test_helper_exists(self): self.assertTrue(hasattr(util, 'helper'))\n")
+    # Configuration: fixed order, one exclusion, one probe on the base and on PR 3.
     config = tmp / "config.json"
     config.write_text(json.dumps(dict(
         UNITTEST, repo="local/test", base="main", required_status="ci", workers=2,
@@ -143,6 +153,7 @@ class BuildEndToEnd(unittest.TestCase):
     """One full build of a fixture with merges, conflicts, failures and probes, checked end to end."""
     @classmethod
     def setUpClass(cls):
+        """Build the fixture once, twice over, so determinism can be checked against a second run."""
         cls._tmp = tempfile.TemporaryDirectory()
         tmp = Path(cls._tmp.name)
         cls.cfg, snap, bundle = make_project(tmp)
@@ -151,46 +162,58 @@ class BuildEndToEnd(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        """Remove the fixture's temporary directory."""
         cls._tmp.cleanup()
 
     def test_tests_pass_on_base(self):
+        """The fixture's base passes its own tests, so every later result is meaningful."""
         self.assertEqual(self.res["base_tests"]["outcome"], "pass")
 
     def test_merged_set(self):
+        """Exactly the PRs expected to combine end up merged."""
         self.assertEqual(self.res["merged"], [1, 3, 5])
 
     def test_tests_cannot_see_git(self):
+        """Test runs see no .git directory, so PR code cannot reach the repository."""
         self.assertIn(5, self.res["merged"])
 
     def test_text_conflict_is_swapped_in(self):
+        """A PR that conflicts on text passes once its blocker is reverted."""
         swap = self.res["swaps"]["2"]
         self.assertEqual((swap["blockers"], swap["outcome"]), ([1], "pass"))
 
     def test_culprit_found_and_pair_confirmed(self):
+        """Bisection names the PR that breaks another, and the pair test confirms it."""
         c = self.res["culprits"]["4"]
         self.assertEqual(c["culprit"], 3)
         self.assertEqual((c["pair"]["outcome"], c["pair"]["failures"]), ("fail", ["test_helper"]))
 
     def test_failure_on_base_alone_is_not_blamed_on_others(self):
+        """A PR that fails on the base by itself gets no culprit."""
         self.assertEqual(self.res["culprits"]["9"], {"on_base": "fail"})
 
     def test_not_tried_reasons(self):
+        """Excluded, failing-status and test-less PRs are reported with their reasons."""
         got = {r["pr"]: r["reason"] for r in self.res["not_tried"]}
         self.assertEqual(got, {6: "excluded", 7: "status", 8: "no_tests"})
 
     def test_probe_results(self):
+        """Probes run on each target and report pass or fail."""
         got = [(p["target"], p["outcome"]) for p in self.res["probes"]]
         self.assertEqual(got, [("base", "pass"), (3, "fail")])
 
     def test_sequence_run_count(self):
+        """The sequential build uses the expected number of test-suite runs."""
         # base 1 + #1 1 + #2 conflict 0 + #3 1 + #4 failing twice 2 + #5 1 + #9 failing twice 2
         self.assertEqual(self.res["test_runs"]["sequence"], 8)
 
     def test_same_inputs_same_results(self):
+        """Two builds of the same snapshot give identical results, timings aside."""
         strip = lambda r: {k: v for k, v in r.items() if k != "timing"}
         self.assertEqual(strip(self.res), strip(self.again))
 
     def test_timing_matches_run_counts(self):
+        """Recorded timings cover exactly the runs that were counted."""
         t = self.res["timing"]
         for phase in ("sequence", "swap", "culprit", "probe"):
             self.assertEqual(t["run_seconds"][phase]["count"], self.res["test_runs"][phase], phase)
@@ -199,6 +222,7 @@ class BuildEndToEnd(unittest.TestCase):
         self.assertAlmostEqual(w["total"], w["sequence"] + w["follow_ups"], delta=0.2)
 
     def test_report_is_deterministic(self):
+        """Rendering the two builds' results gives the same report."""
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
 
 
@@ -228,13 +252,16 @@ PASSING = "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): 
 class SmallBuilds(unittest.TestCase):
     """Single-PR builds that exercise one rule or stop condition each."""
     def setUp(self):
+        """Fresh temporary directory per test."""
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
 
     def tearDown(self):
+        """Remove the temporary directory."""
         self._tmp.cleanup()
 
     def test_failing_base_stops_the_build(self):
+        """A base that fails its tests stops the build and leaves no files behind."""
         failing = "import unittest\nclass T(unittest.TestCase):\n    def test_base(self): self.fail('broken')\n"
         cfg, snap, bundle = small_project(self.tmp, failing, "SUCCESS")
         with self.assertRaises(SystemExit) as stop:
@@ -244,6 +271,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertFalse((self.tmp / "work-a").exists())
 
     def test_nothing_eligible_renders_compactly(self):
+        """A build with no eligible PRs still renders a short, clean report."""
         cfg, snap, bundle = small_project(self.tmp, PASSING, "FAILURE")
         text = audit.render(cfg, build(cfg, snap, bundle, self.tmp, "a"))
         self.assertIn("### Result: no PRs were eligible to try", text)
@@ -252,6 +280,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertNotIn("\n\n\n", text)
 
     def test_ignore_status_is_applied_and_shown(self):
+        """--ignore-status tries failing-status PRs and says so in the report."""
         cfg, snap, bundle = small_project(self.tmp, PASSING, "FAILURE")
         res = build(cfg, snap, bundle, self.tmp, "a", ignore_status=True)
         self.assertEqual(res["merged"], [1])
@@ -259,6 +288,7 @@ class SmallBuilds(unittest.TestCase):
 
 
     def test_lfs_base_stops_the_build_unless_allowed(self):
+        """A base using Git LFS stops the build unless explicitly allowed."""
         lfs = {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n"}
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", lfs)
         with self.assertRaises(SystemExit) as stop:
@@ -271,6 +301,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("**Override:** test runs lack Git LFS files", audit.render(cfg, res))
 
     def test_lfs_added_by_a_pr_stops_the_build_unless_allowed(self):
+        """A PR that adds Git LFS stops the build unless explicitly allowed."""
         lfs = {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n"}
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", pr_files=lfs)
         with self.assertRaises(SystemExit) as stop:
@@ -282,6 +313,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("**Override:** test runs of PRs #1 (Git LFS files) lack", audit.render(cfg, res))
 
     def test_probe_without_targets_stops_before_any_test(self):
+        """A probe with no targets is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD}]
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
@@ -291,6 +323,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertFalse((self.tmp / "work-a").exists())
 
     def test_bad_probe_target_stops_before_any_test(self):
+        """A probe naming a PR not in the snapshot is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 99]}]
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
@@ -301,6 +334,7 @@ class SmallBuilds(unittest.TestCase):
 
 
     def test_flaky_pr_gets_no_culprit_search_and_one_label(self):
+        """A flaky PR gets no culprit search and is listed once, as flaky."""
         marker = self.tmp / "ran-once"
         flaky = ("import os, unittest\nclass T(unittest.TestCase):\n    def test_p1(self):\n"
                  f"        if not os.path.exists({str(marker)!r}):\n"
@@ -313,6 +347,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertNotIn("no single culprit", text)
 
     def test_environment_line_names_python_only_when_used(self):
+        """The report names a Python version only if a command uses Python."""
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
         self.assertIn("python", audit.tool_versions(cfg))
         cfg = dict(cfg, test_cmd=[sys.executable, "-m", "unittest"])
@@ -320,6 +355,7 @@ class SmallBuilds(unittest.TestCase):
 
 
     def test_a_failing_job_is_recorded_and_the_rest_kept(self):
+        """A follow-up job that raises is recorded as an error; other results survive."""
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 2]}]
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
@@ -343,29 +379,41 @@ class Packaging(unittest.TestCase):
         self.assertIn('pr-merge-audit = "pr_merge_audit:main"', pyproject)
 
     def test_version_matches_the_package_metadata(self):
+        """The module's __version__ matches pyproject.toml."""
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn(f'version = "{audit.__version__}"', pyproject)
 
     def test_source_files_carry_a_license_header_and_documented_functions(self):
-        """Every Python file starts with an SPDX header; every function and class in the tool has a docstring."""
+        """Every Python file starts with an SPDX header; every function and class has a docstring."""
         import ast
         for path in [ROOT / "pr_merge_audit.py", *sorted((ROOT / "tests").glob("*.py"))]:
             head = path.read_text(encoding="utf-8").splitlines()[:3]
             self.assertIn("# SPDX-License-Identifier: Apache-2.0", head, path.name)
-        tree = ast.parse((ROOT / "pr_merge_audit.py").read_text(encoding="utf-8"))
-        undocumented = [n.name for n in ast.walk(tree)
-                        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and not ast.get_docstring(n)]
-        self.assertEqual(undocumented, [])
+        for path in (ROOT / "pr_merge_audit.py", ROOT / "tests" / "test_pr_merge_audit.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            undocumented = [n.name for n in ast.walk(tree)
+                            if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and not ast.get_docstring(n)]
+            self.assertEqual(undocumented, [], path.name)
+
+    def test_tool_is_commented_densely(self):
+        """At least one comment line per ten lines of the tool, so the code stays explained as it grows."""
+        import io
+        import tokenize
+        src = (ROOT / "pr_merge_audit.py").read_text(encoding="utf-8")
+        comments = sum(1 for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type == tokenize.COMMENT)
+        self.assertGreaterEqual(comments * 10, len(src.splitlines()))
 
 
 class Portability(unittest.TestCase):
     """Behaviour that must hold identically on Linux, macOS and Windows."""
     def test_archive_paths_absolute_on_any_platform_are_refused(self):
+        """Absolute paths in any platform's syntax are recognised as absolute."""
         for name in ("/etc/x", "\\x", "C:x", "C:\\x", "\\\\host\\share\\x"):
             self.assertTrue(audit.absolute(name), name)
         self.assertFalse(audit.absolute("a/b"))
 
     def test_read_only_files_are_removed(self):
+        """Directory trees holding read-only files can still be deleted."""
         with tempfile.TemporaryDirectory() as tmp:
             tree = Path(tmp) / "t"
             (tree / "objects").mkdir(parents=True)
@@ -375,6 +423,7 @@ class Portability(unittest.TestCase):
             self.assertFalse(tree.exists())
 
     def test_written_files_are_utf8_with_lf_line_ends(self):
+        """Output files are UTF-8 with LF line ends on every platform."""
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "r.md"
             audit.write_text(out, "caf\u00e9 \u2713\n")
@@ -395,12 +444,14 @@ class ProcessDocs(unittest.TestCase):
 class JobErrors(unittest.TestCase):
     """Failed follow-up jobs are recorded without losing other results; timing statistics are correct."""
     def test_every_kind_of_failed_job_is_recorded(self):
+        """Swap, culprit and probe errors each produce the right result record."""
         exc = RuntimeError("boom")
         self.assertEqual(audit.job_error("swap", 5, exc), {"blockers": [], "outcome": "error", "message": "RuntimeError: boom"})
         self.assertEqual(audit.job_error("culprit", 5, exc), {"error": "RuntimeError: boom"})
         self.assertEqual(audit.job_error("probe", ("p", 2), exc)["target"], 2)
 
     def test_median_of_an_even_count_is_the_mean_of_the_middle_two(self):
+        """Timing medians follow the standard definition."""
         self.assertEqual(audit.timing_summary({}, {"swap": [10, 100]})["run_seconds"]["swap"]["median"], 55)
 
 
@@ -420,18 +471,22 @@ class Classify(unittest.TestCase):
                         for n, kw in prs]}
 
     def test_order_then_number(self):
+        """Configured order comes first; the rest follow by PR number."""
         eligible, _ = audit.classify(self.cfg(order=[3]), self.snap((1, {}), (2, {}), (3, {})))
         self.assertEqual(eligible, [3, 1, 2])
 
     def test_first_matching_reason_wins(self):
+        """When several rules apply, the highest-priority reason is reported."""
         _, skipped = audit.classify(self.cfg(exclude={1: "x"}), self.snap((1, {"status": "FAILURE", "draft": True})))
         self.assertEqual(skipped[0]["reason"], "excluded")
 
     def test_status_ignored_when_not_required(self):
+        """Without a required check, check state does not exclude PRs."""
         eligible, _ = audit.classify(self.cfg(required_status=""), self.snap((1, {"status": "FAILURE"})))
         self.assertEqual(eligible, [1])
 
     def test_test_files_pattern(self):
+        """A custom test-file pattern decides which PRs count as tested."""
         cfg = self.cfg(test_files=r"_test\.py$")
         eligible, skipped = audit.classify(cfg, self.snap((1, {"files": ["pkg/a_test.py"]}),
                                                          (2, {"files": ["pkg/a.py"]})))
@@ -441,21 +496,25 @@ class Classify(unittest.TestCase):
 class Helpers(unittest.TestCase):
     """Small pure functions: placeholder filling, output scanning, Markdown escaping."""
     def test_git_version(self):
+        """git version strings are parsed, and unparseable ones give (0, 0)."""
         self.assertEqual(audit.git_version("git version 2.50.1 (Apple Git-155)"), (2, 50))
         self.assertEqual(audit.git_version("git version 2.45.1.windows.1"), (2, 45))
         self.assertLess(audit.git_version("git version 2.37.9"), audit.MIN_GIT)
         self.assertLess(audit.git_version(""), audit.MIN_GIT)
 
     def test_fill_leaves_other_braces(self):
+        """Only named placeholders are replaced; other braces stay as written."""
         self.assertEqual(audit.fill(["{python}", "{1..3}", '{"a": 1}', "{dest}"], python="py", dest=Path("t/x.py")),
                          ["py", "{1..3}", '{"a": 1}', "t/x.py"])
 
     def test_scan_uses_group_one_and_ignores_non_numbers(self):
+        """Output scanning reads capture group 1 and tolerates non-numeric counts."""
         cfg = {"failure_pattern": r"^(\S+) (FAILED|ERROR)", "count_pattern": r"^ran: (\S+)"}
         res = audit.scan(cfg, 1, "a.b FAILED\nc.d ERROR\nran: many\n")
         self.assertEqual((res["failures"], res["ran"]), (["a.b", "c.d"], 0))
 
     def test_job_errors_render(self):
+        """Error results render as readable report lines."""
         res = json.loads((GOLDEN / "results.json").read_text())
         a, b = (str(x) for x in res["order"][-2:])
         res["swaps"][a] = {"blockers": [], "outcome": "error", "message": "RuntimeError: boom"}
@@ -465,6 +524,7 @@ class Helpers(unittest.TestCase):
         self.assertIn(f"**Culprit search could not run:** #{b} (`RuntimeError: bang`).", text)
 
     def test_empty_blockers_render_in_words(self):
+        """A swap with no blockers is described in words, not as an empty list."""
         res = json.loads((GOLDEN / "results.json").read_text())
         n = str(res["order"][-1])
         res["swaps"][n] = {"blockers": [], "outcome": "conflict"}
@@ -473,9 +533,11 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("with ;", text)
 
     def test_names_keeps_spaces(self):
+        """NUL-separated path lists keep spaces inside names."""
         self.assertEqual(audit.names("a b.py\0c.py\0"), ["a b.py", "c.py"])
 
     def test_clean_cannot_leave_code_span_or_cell(self):
+        """Escaped test output cannot break out of a code span or table cell."""
         text = audit.clean("x` | @a ![i](http://e) \n### h" + "y" * 300, table=True)
         self.assertNotIn("`", text)
         self.assertNotIn("\n", text)
@@ -483,17 +545,20 @@ class Helpers(unittest.TestCase):
         self.assertLessEqual(len(text), 203 + text.count("\\"))
 
     def test_scan_without_patterns_uses_exit_status(self):
+        """Without output patterns, only the exit status decides the outcome."""
         self.assertEqual(audit.scan({}, 0, "anything")["outcome"], "pass")
         res = audit.scan({}, 3, "anything")
         self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(exit status 3)"]))
 
     def test_scan_count_pattern_requires_a_test(self):
+        """With a count pattern, a zero-test run is not a pass."""
         cfg = {"count_pattern": r"^(\d+) passed", "failure_pattern": r"^FAILED (\S+)"}
         self.assertEqual(audit.scan(cfg, 0, "4 passed")["outcome"], "pass")
         self.assertEqual(audit.scan(cfg, 0, "0 passed")["failures"], ["(no tests ran)"])
         self.assertEqual(audit.scan(cfg, 1, "FAILED a::b\nFAILED a::c\n")["failures"], ["a::b", "a::c"])
 
     def test_read_capped(self):
+        """Oversized output keeps its head and tail and is marked as truncated."""
         with tempfile.TemporaryDirectory() as d:
             small, big = Path(d) / "s", Path(d) / "b"
             small.write_text("ok")
@@ -508,6 +573,7 @@ class Helpers(unittest.TestCase):
 class Containment(unittest.TestCase):
     """Archive members that could write outside the export directory are refused."""
     def setUp(self):
+        """An export directory and a directory outside it, per test."""
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.root = self.tmp / "root"
@@ -516,6 +582,7 @@ class Containment(unittest.TestCase):
         self.outside.mkdir()
 
     def tearDown(self):
+        """Remove both directories."""
         self._tmp.cleanup()
 
     def member(self, name, kind=tarfile.REGTYPE, link=""):
@@ -525,6 +592,7 @@ class Containment(unittest.TestCase):
         return m
 
     def test_safe_member(self):
+        """Each kind of tar member is accepted or refused as expected."""
         (self.root / "up").symlink_to(self.outside)
         cases = {
             ("a/b.py", tarfile.REGTYPE, ""): True,
@@ -541,15 +609,18 @@ class Containment(unittest.TestCase):
                 self.assertIs(audit.safe_member(self.root, self.member(name, kind, link)), want)
 
     def test_probe_written_into_missing_directory(self):
+        """A probe can be placed in a directory that does not exist yet."""
         self.assertIsNone(audit.place_probe(self.root, Path("tests/p.py"), b"x"))
         self.assertEqual((self.root / "tests" / "p.py").read_bytes(), b"x")
 
     def test_probe_refuses_symlinked_directory(self):
+        """A probe is not written through a symlinked directory."""
         (self.root / "tests").symlink_to(self.outside)
         self.assertIsNotNone(audit.place_probe(self.root, Path("tests/p.py"), b"x"))
         self.assertEqual(list(self.outside.iterdir()), [])
 
     def test_probe_refuses_existing_file_or_link(self):
+        """A probe never overwrites a file or link the PR placed."""
         (self.root / "tests").mkdir()
         target = self.outside / "victim"
         target.write_text("keep")
@@ -558,6 +629,7 @@ class Containment(unittest.TestCase):
         self.assertEqual(target.read_text(), "keep")
 
     def test_work_directory_needs_marker(self):
+        """A non-empty work directory without the marker is never cleared."""
         work = self.tmp / "work"
         work.mkdir()
         (work / "keep.txt").write_text("keep")
@@ -588,6 +660,7 @@ class TreeFixture:
     """A one-commit repository built from raw trees, bundled and opened as a Workspace."""
 
     def setUp(self):
+        """A scratch repository in which tests build arbitrary trees."""
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name).resolve()
         self.src = self.tmp / "src"
@@ -597,6 +670,7 @@ class TreeFixture:
         self.victim.write_text("keep")
 
     def tearDown(self):
+        """Remove the scratch repository."""
         self._tmp.cleanup()
 
     def workspace(self, tree, **cfg):
@@ -617,6 +691,7 @@ class HostileTrees(TreeFixture, unittest.TestCase):
     """Commits a PR author could push, run through the real export and test steps."""
 
     def test_chained_link_is_pruned_and_never_written_through(self):
+        """A chain of links that escapes the export is removed and never followed."""
         # sub/s points at the copy's root, so the text of T cancels out while on disk it climbs to /.
         up = "/".join(["sub/s"] * 20 + [".."] * 40)
         sub = mktree(self.src, [("120000", "s", "..")])
@@ -635,6 +710,7 @@ class HostileTrees(TreeFixture, unittest.TestCase):
             shutil.rmtree(scratch)
 
     def test_export_ignore_cannot_hide_files(self):
+        """A PR's .gitattributes cannot drop files from the test copy."""
         tree = mktree(self.src, [("100644", ".gitattributes", "tests/test_hidden.py export-ignore\n"),
                                  ("040000", "tests", mktree(self.src, [("100644", "test_hidden.py", PASSING)]))])
         ws, head = self.workspace(tree)
@@ -645,12 +721,14 @@ class HostileTrees(TreeFixture, unittest.TestCase):
             shutil.rmtree(scratch)
 
     def test_early_exit_is_not_a_pass(self):
+        """A suite that exits 0 before running tests is not reported as passing."""
         ws, head = self.workspace(self.pr_tree({"test_x.py": "import os\nos._exit(0)\n"}))
         wt = ws.tree("t", head)
         res = ws.test_once(wt, [sys.executable, "-m", "unittest", "discover", "-s", "tests"])
         self.assertEqual((res["outcome"], res["failures"]), ("fail", ["(no tests ran)"]))
 
     def test_home_and_temp_directories_are_private_on_every_platform(self):
+        """Test runs see private home and temp directories, not the operator's."""
         real_home, real_tmp = os.path.expanduser("~"), tempfile.gettempdir()
         check = ("import os, tempfile, unittest\n"
                  "class T(unittest.TestCase):\n"
@@ -663,6 +741,7 @@ class HostileTrees(TreeFixture, unittest.TestCase):
         self.assertEqual(res["outcome"], "pass", res.get("failures"))
 
     def test_background_processes_are_stopped(self):
+        """Processes a test leaves running are stopped when the run ends."""
         pidfile = self.tmp / "pid"
         start = ("import subprocess, sys, unittest\n"
                  "class T(unittest.TestCase):\n"
@@ -699,21 +778,25 @@ class Unsupported(TreeFixture, unittest.TestCase):
     """Setups the tool cannot test faithfully are detected, not silently mis-read."""
 
     def test_gitlink_and_nested_lfs_are_detected(self):
+        """Submodules and nested LFS attributes are both detected."""
         lfs = mktree(self.src, [("100644", ".gitattributes", "*.bin filter=lfs -text\n")])
         tree = mktree(self.src, [("160000", "vendor", "1" * 40), ("040000", "assets", lfs)])
         ws, head = self.workspace(tree)
         self.assertEqual(ws.incomplete_checkout(head), ["submodules", "Git LFS files"])
 
     def test_plain_tree_is_complete(self):
+        """An ordinary tree is reported as complete."""
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
         self.assertEqual(ws.incomplete_checkout(head), [])
 
     def test_conflict_with_base_is_not_called_a_test_failure(self):
+        """A PR that conflicts with the base is reported as a conflict, not a failure."""
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
         ws.heads[5] = git_in(self.src, "commit-tree", self.pr_tree({"test_ok.py": PASSING + "# changed\n"}), "-m", "unrelated")
         self.assertEqual(audit.find_culprit(ws, 5, [], "c"), {"on_base": "conflict"})
 
     def test_merge_tree_error_is_not_read_as_no_conflict(self):
+        """A git error during conflict detection raises instead of reading as clean."""
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}))
         ws.heads[5] = "0" * 40
         with self.assertRaises(RuntimeError):
@@ -734,6 +817,7 @@ class Toolchain(TreeFixture, unittest.TestCase):
     """pass_env, env and setup_cmd reach the real test process."""
 
     def test_pass_env_and_env_reach_tests(self):
+        """Variables from pass_env and env reach the test process."""
         os.environ.update(AUDIT_PASSED="from-caller", AUDIT_NOT_LISTED="secret")
         self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("AUDIT_PASSED", "AUDIT_NOT_LISTED")])
         ws, head = self.workspace(self.pr_tree({"test_env.py": ENV_TEST}),
@@ -741,22 +825,26 @@ class Toolchain(TreeFixture, unittest.TestCase):
         self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
 
     def test_unlisted_variables_stay_out(self):
+        """Variables not listed are withheld from the test process."""
         os.environ["AUDIT_PASSED"] = "from-caller"
         self.addCleanup(os.environ.pop, "AUDIT_PASSED", None)
         ws, head = self.workspace(self.pr_tree({"test_env.py": ENV_TEST}))
         self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "fail")
 
     def test_setup_cmd_runs_first_in_the_same_copy(self):
+        """setup_cmd runs before the tests, in the same copy."""
         setup = ["{python}", "-c", "open('tests/generated.py', 'w').write('X = 1\\n')"]
         ws, head = self.workspace(self.pr_tree({"test_setup.py": SETUP_TEST}), setup_cmd=setup)
         self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
 
     def test_braces_in_commands_are_kept(self):
+        """Braces in commands that are not placeholders reach the process unchanged."""
         setup = ["{python}", "-c", "d = {'a': 1}; open('tests/generated.py', 'w').write('X = 1')"]
         ws, head = self.workspace(self.pr_tree({"test_setup.py": SETUP_TEST}), setup_cmd=setup)
         self.assertEqual(ws.test_once(ws.tree("t", head), UNITTEST_ARGV)["outcome"], "pass")
 
     def test_failed_setup_is_a_failure_and_tests_do_not_run(self):
+        """A failed setup is a failure, and the tests are skipped."""
         setup = ["{python}", "-c", "import sys; print('no toolchain'); sys.exit(3)"]
         ws, head = self.workspace(self.pr_tree({"test_ok.py": PASSING}), setup_cmd=setup)
         res = ws.test_once(ws.tree("t", head), UNITTEST_ARGV)
@@ -764,6 +852,7 @@ class Toolchain(TreeFixture, unittest.TestCase):
         self.assertEqual(res["message"], "setup_cmd exit status 3: no toolchain")
 
     def test_config_rejects_malformed_keys(self):
+        """Malformed pass_env, env and setup_cmd values are rejected at load time."""
         for bad in ({"pass_env": "PATH"}, {"env": {"A": 1}}, {"setup_cmd": "make"}, {"setup_cmd": []}):
             path = self.tmp / "c.json"
             path.write_text(json.dumps(dict(UNITTEST, **bad)))
@@ -774,22 +863,28 @@ class Toolchain(TreeFixture, unittest.TestCase):
 class TokenRedirect(unittest.TestCase):
     """The API token is never forwarded when a request is redirected to another host."""
     def test_token_not_sent_to_redirect_target(self):
+        """The API token is dropped when the server redirects to another host."""
         seen = {}
 
         class Target(http.server.BaseHTTPRequestHandler):
+            """Stand-in for the redirect target; records the Authorization header it receives."""
             def do_GET(self):
+                """Answer with an empty JSON object."""
                 seen["auth"] = self.headers.get("Authorization")
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"{}")
 
             def log_message(self, *a):
+                """Keep test output free of request logs."""
                 pass
 
         target = http.server.HTTPServer(("127.0.0.1", 0), Target)
 
         class Redirect(Target):
+            """Stand-in for the API host; records the header, then redirects to the target."""
             def do_GET(self):
+                """Answer with a redirect to the target host."""
                 seen["first"] = self.headers.get("Authorization")
                 self.send_response(302)
                 self.send_header("Location", f"http://127.0.0.1:{target.server_port}/x")
@@ -815,14 +910,18 @@ class TokenRedirect(unittest.TestCase):
 class RateLimit(unittest.TestCase):
     """API errors end the run with an actionable message, including rate-limit reset times."""
     def test_rate_limit_exits_with_a_hint(self):
+        """A rate-limited API call exits with the reset time and a token hint."""
         class Limited(http.server.BaseHTTPRequestHandler):
+            """Stand-in for an API that answers every request with a rate-limit error."""
             def do_GET(self):
+                """Answer with HTTP 403 and exhausted rate-limit headers."""
                 self.send_response(403, "rate limit exceeded")
                 self.send_header("X-RateLimit-Remaining", "0")
                 self.send_header("X-RateLimit-Reset", "0")
                 self.end_headers()
 
             def log_message(self, *a):
+                """Keep test output free of request logs."""
                 pass
 
         server = http.server.HTTPServer(("127.0.0.1", 0), Limited)
@@ -842,6 +941,7 @@ class Golden(unittest.TestCase):
     """Results of a build of the fixture in make_project, and the report they render to."""
 
     def test_golden_report(self):
+        """The stored results still render exactly as the reviewed golden report."""
         res = json.loads((GOLDEN / "results.json").read_text())
         self.assertEqual(audit.render({}, res), (GOLDEN / "report.md").read_text())
 
