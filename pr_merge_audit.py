@@ -82,12 +82,16 @@ def load_config(path):
 
     Exits with a message on invalid input, so a misconfiguration fails before any work starts.
     """
+    # Parse the JSON configuration file.
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    # The test command is the only mandatory setting.
     if not cfg.get("test_cmd"):
         sys.exit(f"{path}: test_cmd is required")
+    # Every probe must say how to run it.
     for probe in cfg.get("probes", []):
         if not probe.get("cmd"):
             sys.exit(f"{path}: probe {probe.get('name')!r} needs a cmd")
+    # Defaults: the current interpreter, a tests/ directory, a 30-minute run limit, 4 workers.
     cfg.setdefault("python", sys.executable)
     cfg.setdefault("test_prefix", "tests/")
     cfg.setdefault("test_files", "^" + re.escape(cfg["test_prefix"]))
@@ -97,14 +101,18 @@ def load_config(path):
     # JSON object keys are strings; PR numbers are used as integers everywhere else.
     for key in ("exclude", "duplicates", "features"):
         cfg[key] = {int(k): v for k, v in cfg.get(key, {}).items()}
+    # PRs allowed to change code without changing tests.
     cfg["no_tests_ok"] = set(cfg.get("no_tests_ok", []))
+    # Optional sections default to empty.
     cfg.setdefault("probes", [])
     cfg.setdefault("pass_env", [])
     cfg.setdefault("env", {})
+    # Validate the environment settings, since they are passed straight to subprocesses.
     if not (isinstance(cfg["pass_env"], list) and all(isinstance(k, str) for k in cfg["pass_env"])):
         sys.exit(f"{path}: pass_env must be a list of variable names")
     if not (isinstance(cfg["env"], dict) and all(isinstance(v, str) for v in cfg["env"].values())):
         sys.exit(f"{path}: env must map variable names to strings")
+    # A setup command, when present, must be an argument list.
     if "setup_cmd" in cfg and not (isinstance(cfg["setup_cmd"], list) and cfg["setup_cmd"]):
         sys.exit(f"{path}: setup_cmd must be a non-empty list of arguments")
     # Probe files are resolved relative to the configuration file.
@@ -114,6 +122,7 @@ def load_config(path):
 
 def fill(args, **values):
     """Replace `{name}` placeholders by plain substitution, so other braces in arguments are left alone."""
+    # Substitute each placeholder in each argument; Path values use forward slashes everywhere.
     out = []
     for a in args:
         for k, v in values.items():
@@ -132,13 +141,16 @@ def windows_job(proc):
     including children whose parent has already exited. Returns None if that is not possible."""
     import ctypes
     from ctypes import wintypes
+    # Declare the Win32 signatures used, so handles are passed at full width on 64-bit Windows.
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateJobObjectW.restype = wintypes.HANDLE
     k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    # Create an anonymous job and attach the test process to it.
     job = k32.CreateJobObjectW(None, None)
     if job and k32.AssignProcessToJobObject(job, int(proc._handle)):
         return job
+    # Assignment failed: release the job and fall back to stopping the single process.
     if job:
         k32.CloseHandle(wintypes.HANDLE(job))
     return None
@@ -151,12 +163,14 @@ def stop_windows_job(job):
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    # Stop every process in the job, then release it.
     k32.TerminateJobObject(job, 1)
     k32.CloseHandle(job)
 
 
 def write_text(path, text):
     """Write UTF-8 with LF line ends on every platform, so results and reports are identical."""
+    # Explicit encoding and newline override the platform defaults.
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
 
@@ -170,6 +184,7 @@ def remove_tree(path, strict=False):
         func(p)
     # Python 3.12 renamed the callback; keep both versions supported.
     hook = {"onexc": retry} if sys.version_info >= (3, 12) else {"onerror": retry}
+    # Delete the tree; a remaining failure is ignored unless the caller requires success.
     try:
         shutil.rmtree(path, **hook)
     except OSError:
@@ -182,10 +197,12 @@ def git(repo, *args, check=True, binary=False):
 
     Hooks and filesystem monitors are disabled, so repository content cannot run code here.
     """
+    # Minimal environment plus the fixed git identity.
     env = dict(base_env(), **GIT_ENV)
     # gc.auto=0: parallel jobs merge in worktrees of one repository; a background gc must not race them.
     argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "gc.auto=0", *args]
     text = {} if binary else {"encoding": "utf-8", "errors": "replace"}  # not the locale's code page
+    # Capture output; raise with git's own message when the command fails and `check` is set.
     r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, **text)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
@@ -194,6 +211,7 @@ def git(repo, *args, check=True, binary=False):
 
 def git_version(text):
     """(major, minor) from `git --version` output, (0, 0) if it has none."""
+    # Extract the first major.minor pair, e.g. 2.50 from `git version 2.50.1`.
     m = re.search(r"(\d+)\.(\d+)", text)
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
@@ -201,9 +219,11 @@ def git_version(text):
 def check_git():
     """Exit early with a clear message if git is missing or older than MIN_GIT."""
     try:
+        # Query the installed git; a missing executable counts as no git.
         found = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip()
     except OSError:
         found = ""
+    # Compare against the minimum supported release.
     if git_version(found) < MIN_GIT:
         sys.exit(f"git {MIN_GIT[0]}.{MIN_GIT[1]} or later is needed (for `git merge-tree --write-tree`); "
                  f"found: {found or 'no git on PATH'}")
@@ -211,12 +231,15 @@ def check_git():
 
 def check_probes(cfg, snap):
     """Stop before any test runs if a probe names a missing file or a target not in the snapshot."""
+    # PR numbers in the snapshot, the only valid PR targets.
     numbers = {p["number"] for p in snap["prs"]}
     for probe in cfg["probes"]:
+        # The probe file must exist next to the configuration.
         if not (cfg["_dir"] / probe["file"]).is_file():
             sys.exit(f"probe {probe['name']!r}: file {probe['file']} not found next to the config")
         if not probe.get("targets"):
             sys.exit(f"probe {probe['name']!r}: no targets; list \"base\" and/or PR numbers")
+        # Each target must be the base or a PR in this snapshot.
         for target in probe["targets"]:
             if target != "base" and target not in numbers:
                 sys.exit(f"probe {probe['name']!r}: target {target!r} is neither \"base\" nor an open PR in the snapshot")
@@ -230,8 +253,10 @@ def api(cfg, path):
 
     HTTP and network errors end the run with an actionable message, including rate-limit reset times.
     """
+    # Build the request against the configured API root, asking for the GitHub JSON media type.
     req = urllib.request.Request(cfg["api"].rstrip("/") + path)
     req.add_header("Accept", "application/vnd.github+json")
+    # Authenticate when a token is available; otherwise use anonymous, rate-limited access.
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         # Unredirected, so the token is never sent on to another host.
@@ -239,6 +264,7 @@ def api(cfg, path):
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode())
+    # HTTP error: explain rate limiting when that is the cause, then stop.
     except urllib.error.HTTPError as exc:
         hint = ""
         if exc.code == 429 or (exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"):
@@ -250,6 +276,7 @@ def api(cfg, path):
             if not token:
                 hint += "; set GITHUB_TOKEN for a higher limit"
         sys.exit(f"{req.full_url}: HTTP {exc.code} {exc.reason}{hint}")
+    # Network error (DNS, TLS, connection): stop with the reason.
     except urllib.error.URLError as exc:
         sys.exit(f"{req.full_url}: {exc.reason}")
 
@@ -259,17 +286,21 @@ def required_status(cfg, sha):
 
     Looks at commit statuses first, then at check runs, since projects use either mechanism.
     """
+    # No required check configured: every PR counts as passing.
     name = cfg.get("required_status")
     if not name:
         return "SUCCESS"
+    # Commit statuses (the older API, used by many CLA and CI bots).
     combined = api(cfg, f"/repos/{cfg['repo']}/commits/{sha}/status?per_page=100")
     for s in combined.get("statuses", []):
         if s["context"] == name:
             return s["state"].upper()
+    # Check runs (the newer API, used by GitHub Actions).
     runs = api(cfg, f"/repos/{cfg['repo']}/commits/{sha}/check-runs?check_name={urllib.parse.quote(name, safe='')}")
     # The API returns the most recent run first.
     for run in runs.get("check_runs", []):
         return (run.get("conclusion") or run.get("status") or "").upper()
+    # Neither API reports the check on this commit.
     return "MISSING"
 
 
@@ -280,6 +311,7 @@ def cmd_snapshot(cfg, args):
     re-run offline and reproduced later, even after branches move or are deleted.
     """
     check_git()
+    # The snapshot is named after its UTC date unless one is given.
     date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -304,8 +336,10 @@ def cmd_snapshot(cfg, args):
     specs = [f"+refs/heads/{cfg['base']}:refs/audit/base"]
     specs += [f"+refs/pull/{p['number']}/head:refs/audit/pr/{p['number']}" for p in pulls]
     git(cache, "fetch", "-q", "--no-tags", cfg["remote"], *specs)
+    # Record the exact base commit the PRs are measured against.
     base_sha = git(cache, "rev-parse", "refs/audit/base").stdout.strip()
     prs = []
+    # One record per PR: its head commit, draft flag, required-check state and changed files.
     for p in sorted(pulls, key=lambda p: p["number"]):
         n = p["number"]
         head = git(cache, "rev-parse", f"refs/audit/pr/{n}").stdout.strip()
@@ -318,6 +352,7 @@ def cmd_snapshot(cfg, args):
             "status": required_status(cfg, head),
             "files": sorted(files),
         })
+    # Write the metadata and a bundle of every commit involved, then summarise.
     snap = {"date": date, "repo": cfg["repo"], "base_ref": cfg["base"], "base_sha": base_sha, "prs": prs}
     write_text(out / f"{date}.json", json.dumps(snap, indent=1, sort_keys=True) + "\n")
     git(cache, "bundle", "create", "-q", str((out / f"{date}.bundle").resolve()), "--glob=refs/audit")
@@ -340,13 +375,16 @@ def absolute(name):
 
 def safe_member(root, m):
     """Whether a tar member from `git archive` can be written under `root` without escaping it."""
+    # Refuse absolute paths, parent-directory steps and special files (devices, FIFOs, hard links).
     parts = Path(m.name).parts
     if absolute(m.name) or ".." in parts or not (m.isfile() or m.isdir() or m.issym()):
         return False
+    # A symlink may only point inside the export directory.
     if m.issym():
         target = os.path.normpath(os.path.join(os.path.dirname(m.name), m.linkname))
         if absolute(m.linkname) or target == ".." or target.startswith(".." + os.sep):
             return False
+    # No directory on the way to the member may be a symlink.
     parent = root
     for part in parts[:-1]:
         parent = parent / part
@@ -362,6 +400,7 @@ def safe_member(root, m):
 
 def prune_links(root):
     """Remove links that resolve outside `root`; the text check alone misses chains through other links."""
+    # Resolve every link fully and delete those that end up outside the export.
     top = os.path.realpath(root)
     for d, dirs, files in os.walk(root):
         for name in dirs + files:
@@ -388,14 +427,18 @@ def scan(cfg, rc, out):
         m = re.search(r"\d+", first(key))
         return int(m.group()) if m else 0
 
+    # A run passes on exit status 0, and, when a count pattern is set, only if tests actually ran.
     ran = number("count_pattern")
     res = {"outcome": "pass" if rc == 0 and (ran or not cfg.get("count_pattern")) else "fail"}
+    # Non-zero exit: collect the failing test names, or fall back to the exit status.
     if rc:
         found = [m.group(1) for m in re.finditer(cfg["failure_pattern"], out, re.M)] if cfg.get("failure_pattern") else []
         res["failures"] = sorted(set(found)) or [f"(exit status {rc})"]
         res["message"] = first("message_pattern")
+    # Exit status 0 but no tests counted: an early exit or an empty run.
     elif res["outcome"] == "fail":
         res.update(failures=["(no tests ran)"], message="")
+    # Record counts for the report.
     res["ran"] = ran
     res["skipped"] = number("skipped_pattern")
     return res
@@ -403,6 +446,7 @@ def scan(cfg, rc, out):
 
 def setup_failure(rc, out):
     """Result for a run whose setup_cmd failed; the tests never ran."""
+    # The last non-empty output line usually states why setup failed.
     lines = [x for x in out.splitlines() if x.strip()]
     detail = "timeout" if rc is None else f"exit status {rc}"
     return {"outcome": "fail", "failures": ["(setup failed)"],
@@ -411,6 +455,7 @@ def setup_failure(rc, out):
 
 def read_capped(path):
     """Test output from `path`, keeping the head and tail when it exceeds OUTPUT_CAP."""
+    # Small output is read whole; large output keeps the first and last halves of the cap.
     size = path.stat().st_size
     with open(path, "rb") as f:
         if size <= OUTPUT_CAP:
@@ -424,9 +469,11 @@ def read_capped(path):
 
 def classify(cfg, snap):
     """Split the snapshot into PRs to merge (in order) and PRs not tried, with the reason."""
+    # Apply the rules in priority order; the first that matches decides why a PR is not tried.
     eligible, not_tried = [], []
     for p in snap["prs"]:
         n = p["number"]
+        # A PR counts as tested if it changes a file that matches the test-file pattern.
         has_tests = any(re.search(cfg["test_files"], f) for f in p["files"])
         if n in cfg["exclude"]:
             reason, detail = "excluded", cfg["exclude"][n]
@@ -440,9 +487,11 @@ def classify(cfg, snap):
             reason, detail = "feature", cfg["features"][n]
         elif not has_tests and n not in cfg["no_tests_ok"]:
             reason, detail = "no_tests", ""
+        # No rule matched: the PR is eligible.
         else:
             eligible.append(n)
             continue
+        # Keep the reason and detail for the report's Not tried section.
         not_tried.append({"pr": n, "reason": reason, "detail": detail})
     # Configured order first; every other PR follows in PR-number order.
     rank = {n: i for i, n in enumerate(cfg["order"])}
@@ -458,6 +507,7 @@ class Workspace:
     """
     def __init__(self, cfg, snap, bundle, work):
         """Create a fresh workspace under `work` and load the snapshot bundle into it."""
+        # Paths, synchronisation primitives and per-phase counters.
         self.cfg, self.snap = cfg, snap
         self.work = Path(work).resolve()
         self.repo = self.work / "repo"
@@ -470,14 +520,18 @@ class Workspace:
             if not (self.work / MARKER).is_file():
                 sys.exit(f"refusing to clear {self.work}: no {MARKER} marker, so not a build directory")
             remove_tree(self.work, strict=True)
+        # Create the marker first, so a crashed build can still be cleared next time.
         self.repo.mkdir(parents=True)
         write_text(self.work / MARKER, "created by pr_merge_audit.py; deleted and recreated on each build\n")
+        # A private repository, so PR code never touches the operator's own clones.
         git(self.repo, "init", "-q")
         # Overrides each commit's own .gitattributes, so a PR cannot drop files from the test copy.
         info = self.repo / ".git" / "info"
         info.mkdir(exist_ok=True)
         write_text(info / "attributes", "* -export-ignore -export-subst\n")
+        # Load the frozen snapshot; no network access is needed from here on.
         git(self.repo, "fetch", "-q", str(Path(bundle).resolve()), "+refs/audit/*:refs/audit/*")
+        # Commit ids for the base and each PR head.
         self.base = snap["base_sha"]
         self.heads = {p["number"]: p["head"] for p in snap["prs"]}
 
@@ -502,7 +556,9 @@ class Workspace:
 
         Returns None on success; on a conflict, aborts the merge and returns the conflicting paths.
         """
+        # Always create a merge commit, so each PR can be reverted as one unit later.
         r = git(wt, "merge", "-q", "--no-ff", "--no-edit", "-m", f"merge #{n}", self.heads[n], check=False)
+        # Merge failed: list the conflicted paths, then restore the worktree.
         if r.returncode:
             files = names(git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout)
             git(wt, "merge", "--abort", check=False)
@@ -511,20 +567,24 @@ class Workspace:
 
     def conflicts(self, a, b):
         """Whether targets `a` and `b` have a text conflict, computed in memory without a worktree."""
+        # Exit 0 means a clean merge, exit 1 means conflicts.
         r = git(self.repo, "merge-tree", "--write-tree", "--name-only", self.ref(a), self.ref(b), check=False)
         # A result (clean or conflicted) starts with the merged tree's id; anything else is an error,
         # including exit 1 for an unmergeable ref and 129 from a git without --write-tree.
         if r.returncode not in (0, 1) or not re.match(r"[0-9a-f]{40,64}$", r.stdout.split("\n", 1)[0]):
             raise RuntimeError(f"git merge-tree {a} {b} failed: {r.stderr.strip()}")
+        # True when the two targets conflict.
         return r.returncode == 1
 
     def incomplete_checkout(self, commit):
         """What test runs of `commit` would lack: `git archive` leaves out submodules, and LFS files stay pointers."""
         missing = []
+        # List every entry of the commit's tree.
         rows = [r for r in git(self.repo, "ls-tree", "-r", "-z", commit).stdout.split("\0") if r]
         # Mode 160000 marks a submodule (gitlink) entry.
         if any(r.startswith("160000 ") for r in rows):
             missing.append("submodules")
+        # Any .gitattributes that routes files through the LFS filter means LFS content.
         for r in rows:
             meta, _, path = r.partition("\t")
             if path.rsplit("/", 1)[-1] == ".gitattributes" and meta.split()[1] == "blob":
@@ -548,6 +608,7 @@ class Workspace:
         PR code runs only here, so it cannot reach the shared repository's config, hooks or refs
         through the working tree.
         """
+        # Fresh scratch area: src (the files), home and tmp (private to this run).
         scratch = Path(tempfile.mkdtemp(prefix="audit-run-"))
         root = scratch / "src"
         for d in (root, scratch / "home", scratch / "tmp"):
@@ -561,11 +622,13 @@ class Workspace:
                     if safe_member(root, m):
                         kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
                         tar.extract(m, root, **kw)
+            # A failed archive is an error, not a partial copy.
             proc.stdout.close()
             if proc.wait():
                 raise RuntimeError(f"git archive {commit} failed")
             # Second pass: remove symlinks that escape `root` through chains of other links.
             prune_links(root)
+        # Never leave a half-built export behind, even on interrupt.
         except BaseException:
             remove_tree(scratch)
             raise
@@ -586,6 +649,7 @@ class Workspace:
             home, tmp = str(scratch / "home"), str(scratch / "tmp")
             env.update(USERPROFILE=home, APPDATA=home, LOCALAPPDATA=home, TEMP=tmp, TMP=tmp)
         env.update(self.cfg.get("env", {}))
+        # Output goes to a file, not a pipe, so a chatty suite cannot block on a full buffer.
         log = scratch / "output.log"
         # Each run gets its own process group (POSIX) or job object (Windows), so the whole process
         # tree can be stopped when the run ends or times out.
@@ -594,6 +658,7 @@ class Workspace:
             proc = subprocess.Popen(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
                                     start_new_session=posix)
             job = None if posix else windows_job(proc)
+            # Wait for the run, bounded by the configured timeout; None marks a timeout.
             try:
                 rc = proc.wait(timeout=self.cfg["test_timeout"])
             except subprocess.TimeoutExpired:
@@ -610,6 +675,7 @@ class Workspace:
                 else:
                     proc.kill()
                 proc.wait()
+        # Exit status (None on timeout) and the captured output.
         return rc, read_capped(log)
 
     def execute(self, scratch, root, argv):
@@ -617,6 +683,7 @@ class Workspace:
 
         Returns (rc, output, setup_failed); a failed setup skips `argv`.
         """
+        # Time the whole run, setup included, and file it under the current phase.
         start = time.monotonic()
         try:
             return self._execute(scratch, root, argv)
@@ -626,22 +693,26 @@ class Workspace:
 
     def _execute(self, scratch, root, argv):
         """Run `setup_cmd`, then `argv`; stop after a failed setup. See `execute`."""
+        # Optional setup step, such as installing dependencies, in the same copy as the tests.
         setup = self.cfg.get("setup_cmd")
         if setup:
             rc, out = self.run_in(scratch, root, fill(setup, python=self.cfg["python"]))
             if rc != 0:
                 return rc, out, True
+        # Then the test command itself.
         rc, out = self.run_in(scratch, root, argv)
         return rc, out, False
 
     def test_once(self, wt, argv):
         """One test-suite run of the commit checked out in `wt`, in a fresh isolated copy."""
+        # Count the run, export the worktree's commit and run in that copy.
         self.count()
         scratch, root = self.export(git(wt, "rev-parse", "HEAD").stdout.strip())
         try:
             rc, out, setup_failed = self.execute(scratch, root, argv)
         finally:
             remove_tree(scratch)
+        # Translate the raw result into an outcome record.
         if setup_failed:
             return setup_failure(rc, out)
         if rc is None:
@@ -653,10 +724,12 @@ class Workspace:
 
         A pass on the re-run is reported as `flaky`; two failures report the first run's result.
         """
+        # Default to the configured test command.
         argv = argv or fill(self.cfg["test_cmd"], python=self.cfg["python"])
         first = self.test_once(wt, argv)
         if first["outcome"] == "pass":
             return first
+        # Failed once: re-run to tell a flaky suite from a real failure.
         second = self.test_once(wt, argv)
         if second["outcome"] == "pass":
             return dict(second, outcome="flaky")
@@ -666,6 +739,7 @@ class Workspace:
 def run_sequence(ws, seq):
     """Merge `seq` in order onto the base, keeping only PRs that merge and pass the tests."""
     ws.phase("sequence")
+    # Start from the base and test it first; the build only proceeds if the base itself passes.
     wt = ws.tree("sequence", ws.base)
     steps, merged, final = [], [], ws.test(wt)
     base_result = final
@@ -675,19 +749,24 @@ def run_sequence(ws, seq):
     # Each PR stays merged only if it merges cleanly and the tests pass; otherwise it is held for
     # the follow-up phase and the build continues without it.
     for n in seq:
+        # Merge the next PR; a conflict leaves the build unchanged.
         files = ws.merge(wt, n)
         if files:
             steps.append({"pr": n, "outcome": "conflict", "files": files})
             continue
+        # Test the build with this PR added.
         res = ws.test(wt)
+        # Failing or flaky: drop the merge commit and hold the PR.
         if res["outcome"] != "pass":
             git(wt, "reset", "-q", "--hard", "HEAD~1")
             steps.append(dict(res, pr=n))
             continue
+        # Passing: keep the merge and remember its commit for later reverts.
         commit = git(wt, "rev-parse", "HEAD").stdout.strip()
         merged.append({"pr": n, "commit": commit})
         steps.append({"pr": n, "outcome": "merged"})
         final = res
+    # The tip is the combined build of every PR that merged.
     tip = git(wt, "rev-parse", "HEAD").stdout.strip()
     ws.drop(wt)
     return steps, merged, tip, base_result, final
@@ -696,6 +775,7 @@ def run_sequence(ws, seq):
 def build_from(ws, name, prs):
     """Worktree with `prs` merged onto the base, skipping any that conflict."""
     wt = ws.tree(name, ws.base)
+    # Merge the PRs in order; record which ones actually went in.
     used = [n for n in prs if ws.merge(wt, n) is None]
     return wt, used
 
@@ -713,11 +793,13 @@ def find_culprit(ws, n, seq, name):
         finally:
             ws.drop(wt)
 
+    # First, PR `n` on the base alone: if it already fails or conflicts there, no other PR is to blame.
     on_base = fails_with(0)
     if on_base == "conflict":
         return {"on_base": "conflict"}
     if on_base:
         return {"on_base": "fail"}
+    # Then with every earlier PR: if it passes there, the failure needs the later state of the build.
     lo, hi = 0, len(seq)
     if not fails_with(hi):
         return {"on_base": "pass", "culprit": None}
@@ -743,6 +825,7 @@ def swap(ws, n, merged, tip):
     ws.phase("swap")
     # Blockers are the merged PRs that conflict with PR `n` on their own.
     blockers = [m["pr"] for m in merged if ws.conflicts(n, m["pr"])]
+    # Work on a copy of the combined build.
     res = {"blockers": blockers}
     wt = ws.tree(f"swap-{n}", tip)
     try:
@@ -751,13 +834,16 @@ def swap(ws, n, merged, tip):
             if m["pr"] in blockers and git(wt, "revert", "--no-edit", "-m", "1", m["commit"], check=False).returncode:
                 git(wt, "revert", "--abort", check=False)
                 return dict(res, outcome="revert_conflict")
+        # The swap itself conflicts: report it as such.
         if ws.merge(wt, n):
             return dict(res, outcome="conflict")
+        # Test the build with PR `n` in place of its blockers.
         res.update(ws.test(wt))
     finally:
         ws.drop(wt)
     # Tests still fail after the swap: look for the merged PR that breaks PR `n`.
     if res["outcome"] not in ("pass", "flaky"):
+        # Search only among merged PRs that were not reverted.
         rest = [m["pr"] for m in merged if m["pr"] not in blockers]
         try:
             res["culprit"] = find_culprit(ws, n, rest, f"cul-swap-{n}")
@@ -768,6 +854,7 @@ def swap(ws, n, merged, tip):
 
 def place_probe(root, rel, data):
     """Write the probe file under `root`, refusing symlinks anywhere on the way and existing files."""
+    # Create parent directories one by one, refusing any that is a symlink.
     path = root
     for part in Path(rel).parts[:-1]:
         path = path / part
@@ -780,6 +867,7 @@ def place_probe(root, rel, data):
         fd = os.open(root / rel, flags, 0o644)
     except OSError as exc:
         return f"{rel}: {exc.strerror}"
+    # Write the probe's bytes as-is.
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return None
@@ -791,10 +879,13 @@ def run_probe(ws, probe, target):
     Probes check a specific behaviour that the project's own tests may not cover.
     """
     ws.phase("probe")
+    # Where the probe goes in the target, and its dotted module name for test runners that need one.
     rel = Path(probe.get("dest") or Path(ws.cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
     module = str(rel.with_suffix("")).replace(os.sep, ".")
+    # Resolve the probe command's placeholders.
     argv = fill(probe["cmd"], python=ws.cfg["python"], dest=rel, module=module)
     row = {"probe": probe["name"], "target": target}
+    # Export the target, add the probe, then run it.
     scratch, root = ws.export(ws.ref(target))
     try:
         refused = place_probe(root, rel, (ws.cfg["_dir"] / probe["file"]).read_bytes())
@@ -808,6 +899,7 @@ def run_probe(ws, probe, target):
         return dict(row, outcome="fail", message=setup_failure(rc, out)["message"])
     if rc is None:
         return dict(row, outcome="fail", message="(timeout)")
+    # Reduce the run to an outcome and a one-line message.
     res = scan(ws.cfg, rc, out)
     message = res.get("message") or ("(no tests ran)" if res.get("failures") == ["(no tests ran)"] else "")
     return dict(row, outcome=res["outcome"], message=message)
@@ -815,6 +907,7 @@ def run_probe(ws, probe, target):
 
 def tool_versions(cfg):
     """git, OS and (when used) Python versions, recorded so a report states its environment."""
+    # git version and operating system always; Python only if a command uses it.
     gv = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip().split()[2]
     tools = {"git": gv, "os": platform.system()}
     cmds = [cfg["test_cmd"], cfg.get("setup_cmd") or []] + [p["cmd"] for p in cfg["probes"]]
@@ -841,6 +934,7 @@ def timing_summary(wall, seconds):
         xs = sorted(xs)
         return {"count": len(xs), "total": round(sum(xs), 1), "median": round(statistics.median(xs), 2) if xs else 0,
                 "max": round(xs[-1], 2) if xs else 0}
+    # Rounded, so results stay readable and stable.
     return {"wall_seconds": {k: round(v, 1) for k, v in wall.items()},
             "run_seconds": {k: stats(v) for k, v in seconds.items()}}
 
@@ -852,16 +946,20 @@ def cmd_build(cfg, args):
     culprit searches, probes). Runs PR code; see SECURITY.md.
     """
     check_git()
+    # Load the snapshot and validate probes before doing any work.
     snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
     check_probes(cfg, snap)
+    # The bundle sits next to the snapshot unless given explicitly.
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     print("note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
     # Every deviation from the default rules is recorded and shown at the top of the report.
     overrides = []
+    # Operator chose to try PRs regardless of their required check.
     if args.ignore_status and cfg.get("required_status"):
         overrides.append(f"required status check `{cfg['required_status']}` ignored")
         cfg = dict(cfg, required_status="")
+    # Start the clock and set up the workspace.
     started = time.monotonic()
     ws = Workspace(cfg, snap, bundle, args.work)
     # Pre-flight: stop if test runs would lack submodules or LFS content, unless explicitly allowed.
@@ -872,6 +970,7 @@ def cmd_build(cfg, args):
                  f"set allow_incomplete_checkout to run anyway")
     if missing:
         overrides.append(f"test runs lack {missing} (allow_incomplete_checkout)")
+    # Decide which PRs to try, then check their heads for content test runs would lack.
     seq, not_tried = classify(cfg, snap)
     lacking = {n: ws.incomplete_checkout(ws.heads[n]) for n in seq}
     lacking = ", ".join(f"#{n} ({' and '.join(m)})" for n, m in lacking.items() if m)
@@ -884,6 +983,7 @@ def cmd_build(cfg, args):
     print(f"merging {len(seq)} PRs in order", flush=True)
     # Phase 1: sequential build, one test-suite run at a time.
     steps, merged, tip, base_result, final = run_sequence(ws, seq)
+    # A failing base makes every later result meaningless: stop and say so.
     sequence_done = time.monotonic()
     if base_result["outcome"] not in ("pass", "flaky"):
         remove_tree(ws.work)
@@ -893,6 +993,7 @@ def cmd_build(cfg, args):
     # Phase 2: follow-up jobs for every held PR, plus probes, on `workers` threads.
     held = [s for s in steps if s["outcome"] != "merged"]
     print(f"{len(merged)} merged, {len(held)} held; running follow-ups", flush=True)
+    # Conflicts get a swap test; failures get a culprit search; flaky PRs get neither.
     swaps, culprits, probes = {}, {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
         jobs = {}
@@ -906,6 +1007,7 @@ def cmd_build(cfg, args):
         for probe in cfg["probes"]:
             for target in probe["targets"]:
                 jobs[pool.submit(run_probe, ws, probe, target)] = ("probe", (probe["name"], target))
+        # Collect results as jobs finish; a job that raised is recorded as an error.
         for fut in concurrent.futures.as_completed(jobs):
             kind, n = jobs[fut]
             try:
@@ -947,6 +1049,7 @@ def cmd_build(cfg, args):
         "timing": timing_summary({"total": follow_ups_done - started, "sequence": sequence_done - started,
                                   "follow_ups": follow_ups_done - sequence_done}, ws.seconds),
     }
+    # Write the results file and clear the workspace.
     out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     write_text(out, json.dumps(results, indent=1, sort_keys=True) + "\n")
@@ -959,6 +1062,7 @@ def cmd_build(cfg, args):
 
 def clean(text, table=False):
     """Text from test output, made safe inside a Markdown code span (and a table cell)."""
+    # Collapse control characters, neutralise backticks and cap the length.
     text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text)).replace("`", "'")
     if len(text) > 200:
         text = text[:200] + "..."
@@ -980,6 +1084,7 @@ def render(cfg, res):
 
     Pure function of `res`: the same results always produce the same text (see `verify`).
     """
+    # Index the results for lookup by PR number.
     snap = res["snapshot"]
     base = f"`{snap['base_ref']}` ({snap['base_sha'][:7]})"
     tools = res["tools"]
@@ -987,8 +1092,10 @@ def render(cfg, res):
     swaps = {int(k): v for k, v in res["swaps"].items()}
     culprits = {int(k): v for k, v in res["culprits"].items()}
     tried = len(res["order"])
+    # The report is assembled line by line in `L`; `w` appends one line.
     L = []
     w = L.append
+    # Title, then any overrides, so deviations are seen first.
     w(f"**Merge test of the open PRs against {base}**")
     w("")
     rules = res.get("rules", {})
@@ -999,12 +1106,14 @@ def render(cfg, res):
     w("<details>")
     w("<summary><b>Procedure</b></summary>")
     w("")
+    # Base, environment and test command, as recorded in the results.
     w(f"- **Base:** `{snap['base_ref']}` at `{snap['base_sha'][:7]}`, with PR heads fetched on {snap['date']}.")
     py = f"Python {tools['python']}, " if tools.get("python") else ""
     w(f"- **Environment:** {py}git {tools['git']}, {tools['os']}.")
     skipped = res["final_tests"].get("skipped", 0)
     note = f" {skipped} tests were skipped in the final run." if skipped else ""
     w(f"- **Test run:** `{res['test_cmd']}` after every merge.{note}")
+    # How each phase works, in plain terms.
     w("- **Merging:** each PR is merged with `git merge --no-ff` onto the build so far, in a fixed order "
       "taken from the configuration; PRs not listed there follow in PR-number order.")
     w("  - If a merge conflicts, it's aborted and the PR is recorded as conflicting.")
@@ -1015,6 +1124,7 @@ def render(cfg, res):
     w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
       "its swap, the merge sequence is bisected to the first merged PR that makes it fail; that pair "
       "is then merged onto the base alone and tested.")
+    # The selection rules in force.
     if rules:
         status = f"`{rules['required_status']}` must pass" if rules["required_status"] else "none required"
         w(f"- **Rules:** status check: {status}; a PR counts as changing tests if a file matches "
@@ -1026,6 +1136,7 @@ def render(cfg, res):
     w("")
     w("</details>")
     w("")
+    # Warn if the base itself is unreliable.
     if res["base_tests"]["outcome"] == "flaky":
         w("**Warning:** the tests on the base are flaky (failed, then passed on re-run).")
         w("")
@@ -1045,6 +1156,7 @@ def render(cfg, res):
     # Conflicting PRs, split by whether their tests pass once swapped in.
     ok_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") == "pass"]
     bad_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") != "pass"]
+    # Section: text conflicts that pass once swapped in.
     if ok_swaps:
         w(f"### Text conflicts; tests pass once swapped in ({len(ok_swaps)})")
         w("")
@@ -1056,10 +1168,13 @@ def render(cfg, res):
             w(f"| #{n} | {refs(swaps[n]['blockers']) or '(only the combined build)'} |")
         w("")
 
+    # Section: conflicts whose tests still fail after the swap. Culprit pairs found here are
+    # collected for the next section.
     pairs = []
     if bad_swaps:
         w(f"### Tests fail even after swapping ({len(bad_swaps)})")
         w("")
+    # One line per PR, worded by what happened to its swap test.
     for n in bad_swaps:
         s = swaps[n]
         out = s.get("outcome")
@@ -1083,10 +1198,12 @@ def render(cfg, res):
     if bad_swaps:
         w("")
 
+    # Collect culprit pairs from the failures of the sequential build.
     for n in res["order"]:
         c = culprits.get(n)
         if c and c.get("culprit"):
             pairs.append((c["culprit"], n, c["pair"]))
+    # Section: pairs that merge cleanly but fail their tests together.
     if pairs:
         w(f"### No text conflict, but a pair fails its tests ({len(pairs)})")
         w("")
@@ -1100,6 +1217,7 @@ def render(cfg, res):
 
     # Failures without a confirmed culprit, culprit-search errors and flaky PRs.
     other = []
+    # One entry per PR whose failure has no confirmed culprit, or that was flaky.
     for n in res["order"]:
         st = steps.get(n, {})
         c = culprits.get(n, {})
@@ -1113,12 +1231,14 @@ def render(cfg, res):
             other.append(f"- **Fails only in the full build, no single culprit found:** #{n} ({code(st.get('failures', []))}).")
         if st.get("outcome") == "flaky":
             other.append(f"- **Flaky (failed, then passed on re-run):** #{n}.")
+    # Section: everything else worth a reader's attention.
     if other:
         w("### Other")
         w("")
         L.extend(other)
         w("")
 
+    # Section: probe results, one row per probe and target.
     if res["probes"]:
         w("### Probes")
         w("")
@@ -1138,6 +1258,7 @@ def render(cfg, res):
         ("feature", "Feature, left for separate review"),
         ("no_tests", "Changes code without tests"),
     ]
+    # Section: PRs not tried, by reason.
     if res["not_tried"]:
         w(f"### Not tried ({len(res['not_tried'])} of {res['open_prs']} open PRs)")
         w("")
@@ -1157,6 +1278,7 @@ def render(cfg, res):
         w("")
     # Cost summary, so readers can estimate the effort of a re-run.
     runs = res.get("test_runs")
+    # Footer: how many test-suite runs the build took.
     if runs:
         total = runs["sequence"] + runs["swap"] + runs["culprit"] + runs["probe"]
         w(f"**Test-suite runs:** {total} in total: {runs['sequence']} for the sequential build, "
@@ -1165,6 +1287,7 @@ def render(cfg, res):
           f"parallel workers. Running time scales with the time one test-suite run takes on the "
           f"machine used.")
         w("")
+    # Closing caveat on what the results prove.
     w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
     return "\n".join(L) + "\n"
 
@@ -1172,6 +1295,7 @@ def render(cfg, res):
 def cmd_report(cfg, args):
     """`report` command: render a results file to Markdown (stdout or `--out`)."""
     res = json.loads(Path(args.results).read_text(encoding="utf-8"))
+    # Render, then write to a file or standard output.
     text = render(cfg, res)
     if args.out:
         write_text(Path(args.out), text)
@@ -1182,9 +1306,11 @@ def cmd_report(cfg, args):
 def cmd_verify(cfg, args):
     """`verify` command: check that rendering is stable and, optionally, matches a golden report."""
     res = json.loads(Path(args.results).read_text(encoding="utf-8"))
+    # Render twice from independent reads; any difference means non-deterministic output.
     a, b = render(cfg, res), render(cfg, json.loads(Path(args.results).read_text(encoding="utf-8")))
     if a != b:
         sys.exit("FAIL: two renders of the same results differ")
+    # Optionally compare with a reviewed report and show a diff on mismatch.
     if args.golden:
         want = Path(args.golden).read_text(encoding="utf-8")
         if a != want:
@@ -1198,11 +1324,13 @@ def cmd_estimate(cfg, args):
     """Time one test-suite run here and scale it by the run counts of a reference build."""
     snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
     ref = json.loads(Path(args.reference).read_text(encoding="utf-8"))
+    # The reference build must carry per-phase run counts.
     runs = ref.get("test_runs")
     if not runs:
         sys.exit(f"{args.reference} has no test_runs counts; use results from a newer build")
     check_git()
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
+    # Time one real test-suite run on the base, on this machine.
     ws = Workspace(cfg, snap, bundle, args.work)
     wt = ws.tree("estimate", ws.base)
     argv = fill(cfg["test_cmd"], python=cfg["python"])
@@ -1213,6 +1341,7 @@ def cmd_estimate(cfg, args):
     remove_tree(ws.work)
     # Scale the reference build's run counts by the number of PRs this snapshot would try.
     scale = len(classify(cfg, snap)[0]) / max(1, len(ref["order"]))
+    # Sequential runs happen one at a time; follow-up runs share the workers.
     seq = runs["sequence"] * scale * one
     rest = (runs["swap"] + runs["culprit"] + runs["probe"]) * scale * one / max(1, cfg["workers"])
     print(f"one test-suite run here: {one:.0f} s")
@@ -1227,13 +1356,16 @@ def main():
     for stream in (sys.stdout, sys.stderr):  # a PR title the console's code page lacks must not crash
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
+    # Command-line interface: a global --config and one sub-command per phase.
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="config.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    # snapshot: freeze PR metadata and commits (network).
     s = sub.add_parser("snapshot")
     s.add_argument("--date")
     s.add_argument("--out", default="snapshots")
     s.add_argument("--work", default="work")
+    # build: run the merge test on a snapshot (offline; runs PR code).
     b = sub.add_parser("build")
     b.add_argument("--snapshot", required=True)
     b.add_argument("--bundle")
@@ -1241,22 +1373,27 @@ def main():
     b.add_argument("--out")
     b.add_argument("--ignore-status", action="store_true",
                    help="try PRs whatever their required status check says (shown in the report)")
+    # report: render a results file as Markdown.
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)
     r.add_argument("--out")
+    # verify: check the report is stable and matches a golden copy.
     v = sub.add_parser("verify")
     v.add_argument("--results", required=True)
     v.add_argument("--golden")
+    # estimate: predict the running time of a build on this machine.
     e = sub.add_parser("estimate")
     e.add_argument("--snapshot", required=True)
     e.add_argument("--bundle")
     e.add_argument("--reference", required=True, help="results file of an earlier build")
     e.add_argument("--work", default="work/estimate")
+    # Parse, load the configuration where needed, and dispatch.
     args = ap.parse_args()
     # report and verify read only a results file, so they need no project config.
     cfg = load_config(args.config) if args.cmd in ("snapshot", "build", "estimate") else {}
     {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify, "estimate": cmd_estimate}[args.cmd](cfg, args)
 
 
+# Run as a script.
 if __name__ == "__main__":
     main()
