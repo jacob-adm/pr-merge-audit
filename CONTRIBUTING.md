@@ -17,6 +17,13 @@ the same steps:
 
 The harness's files, tracker and notifications are kept outside this repository.
 
+### Credit
+
+Changes are written with Claude Code, an AI coding agent, and reviewed and merged by the maintainer.
+Commits made this way end with a `Co-Authored-By: Claude <noreply@anthropic.com>` line, so GitHub
+lists Claude as a contributor. Commits from before this was adopted do not carry the line; history
+was not rewritten to add it.
+
 ### What is enforced and what is convention
 
 | Step | Enforced by |
