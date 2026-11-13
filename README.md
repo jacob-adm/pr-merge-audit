@@ -181,19 +181,18 @@ and of the follow-ups.
 
 ### Serial landing, for comparison
 
-Landing the same PRs one at a time costs more. N is the number of PRs tried (merged or not).
-Landing them serially, every PR still open is re-tested after each landing, so the runs are
-N + (N - 1) + ... + 1 = N(N+1)/2. The report states N, that count and the runs this build
-counted. It gives no times, so it stays the same from build to build.
+The report also counts what landing the same PRs one at a time would take. N is the number of
+PRs tried (merged or not). Landing them serially, every PR still open is re-tested after each
+landing, so the runs are N + (N - 1) + ... + 1 = N(N+1)/2. The report states N, that count and
+the runs this build counted, with their ratio when serial landing needs more. It gives no times,
+so it stays the same from build to build.
 
-`estimate` gives the same comparison in hours, from the reference build's measured times: the
-N(N+1)/2 runs times the median run of its sequential build in machine-hours, N times that median
-as the hours to land them (each landing waits for one run), and the reference build's own runs
-and wall-clock time. The sequential median is used because each of its runs is the full suite
-on the base plus the PRs merged so far, which is what a serial landing tests; swap tests run
-only for conflicting PRs, culprit searches test partial builds and probes run a single file.
-Both are estimates: they assume every PR stays until it lands and every run takes the median
-time. A reference without `timing` gets the run count only.
+`estimate` gives the comparison in hours for the snapshot it estimates: N is the number of
+PRs that snapshot would try, and the suite time is the one test-suite run it just timed on the
+base on this machine. It prints the N(N+1)/2 runs times that time in machine-hours, and N times
+it as the hours to land them, assuming one suite run at a time, since each landing waits for its
+run. The suite usually grows as PRs merge, so treat both as a minimum. Both the report and
+`estimate` assume every PR stays until it lands.
 
 ### A measured build
 
@@ -277,6 +276,8 @@ python3 pr_merge_audit.py verify --results tests/golden/results.json --golden te
 ```
 
 which renders the report twice and compares both renders with the golden copy byte for byte.
+Version 1.1 adds the serial-landing line to the report, so a report written by 1.0.x no longer
+matches its results under `verify`; render it again with `report` first.
 After a deliberate change to the report, rebuild the fixture and replace both files.
 
 ## Contributing and security
