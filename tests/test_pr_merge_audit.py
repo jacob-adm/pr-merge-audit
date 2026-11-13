@@ -140,11 +140,12 @@ def make_project(tmp):
     return audit.load_config(str(config)), snap, bundle
 
 
-def build(cfg, snap, bundle, tmp, name, ignore_status=False):
+def build(cfg, snap, bundle, tmp, name, ignore_status=False, emit_branch=None, emit_repo=None):
     """Run the real `build` command on a fixture and return the parsed results file."""
     out = tmp / f"{name}.json"
     args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), work=str(tmp / f"work-{name}"), out=str(out),
-                              ignore_status=ignore_status)
+                              ignore_status=ignore_status, emit_branch=emit_branch,
+                              emit_repo=str(emit_repo) if emit_repo else None)
     audit.cmd_build(cfg, args)
     return json.loads(out.read_text())
 
@@ -224,6 +225,107 @@ class BuildEndToEnd(unittest.TestCase):
     def test_report_is_deterministic(self):
         """Rendering the two builds' results gives the same report."""
         self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.again))
+
+
+def refs_of(repo):
+    """Every ref of `repo` with the commit it points at, for checking what a build changed."""
+    return sh(repo, "git", "for-each-ref", "--format=%(refname) %(objectname)")
+
+
+class EmitBranch(unittest.TestCase):
+    """`build --emit-branch` keeps the merged, passing sequence as a new branch in a named repository."""
+    @classmethod
+    def setUpClass(cls):
+        """Build PRs 1, 2 and 3 of the fixture (2 conflicts with 1) without the flag, then twice with it."""
+        cls._tmp = tempfile.TemporaryDirectory()
+        tmp = cls.tmp = Path(cls._tmp.name)
+        cls.cfg, cls.snap, cls.bundle = make_project(tmp)
+        # Only PRs 1, 2 and 3 are tried; no probes, to keep the build short.
+        cls.cfg.update(order=[1, 2, 3], probes=[], exclude={n: "not in this test" for n in (4, 5, 6, 9)})
+        # The operator's clones: each has the fixture repository as its `origin`.
+        cls.users = [tmp / "user-a", tmp / "user-b"]
+        for user in cls.users:
+            sh(tmp, "git", "clone", "-q", str(tmp / "src"), str(user))
+        cls.origin_before = refs_of(tmp / "src")
+        cls.user_before = refs_of(cls.users[0])
+        cls.plain = build(cls.cfg, cls.snap, cls.bundle, tmp, "plain")
+        cls.res = build(cls.cfg, cls.snap, cls.bundle, tmp, "a", emit_branch="refs/heads/integration",
+                        emit_repo=cls.users[0])
+        cls.again = build(cls.cfg, cls.snap, cls.bundle, tmp, "b", emit_branch="refs/heads/integration",
+                          emit_repo=cls.users[1])
+
+    @classmethod
+    def tearDownClass(cls):
+        """Remove the fixture's temporary directory."""
+        cls._tmp.cleanup()
+
+    def test_ref_points_at_the_final_passing_merge(self):
+        """The branch is the merge of #3 on top of the merge of #1, and holds nothing of #2."""
+        user, heads = self.users[0], {p["number"]: p["head"] for p in json.loads(self.snap.read_text())["prs"]}
+        tip = sh(user, "git", "rev-parse", "refs/heads/integration")
+        self.assertEqual(tip, self.res["emitted"]["commit"])
+        self.assertEqual(sh(user, "git", "log", "--first-parent", "--format=%s", tip).splitlines(),
+                         ["merge #3", "merge #1", "base"])
+        for n, inside in ((1, True), (2, False), (3, True)):
+            rc = subprocess.run(["git", "merge-base", "--is-ancestor", heads[n], tip], cwd=user).returncode
+            self.assertEqual(rc == 0, inside, n)
+
+    def test_manifest_lists_included_and_excluded_prs_with_reasons(self):
+        """The results name the repository, ref and commit, and why each other PR is left out."""
+        m = self.res["emitted"]
+        self.assertEqual((m["ref"], m["included"]), ("refs/heads/integration", [1, 3]))
+        self.assertEqual(Path(m["repo"]), (self.users[0] / ".git").resolve())
+        self.assertEqual(m["excluded"], [{"pr": 2, "reason": "conflict"}]
+                         + [{"pr": n, "reason": "not tried: excluded"} for n in (4, 5, 6)]
+                         + [{"pr": 7, "reason": "not tried: status"}, {"pr": 8, "reason": "not tried: no_tests"},
+                            {"pr": 9, "reason": "not tried: excluded"}])
+
+    def test_only_the_new_branch_is_added_and_nothing_is_pushed(self):
+        """The operator's clone gains exactly one ref, and its remote is untouched."""
+        added = set(refs_of(self.users[0]).splitlines()) - set(self.user_before.splitlines())
+        self.assertEqual(added, {"refs/heads/integration " + self.res["emitted"]["commit"]})
+        self.assertEqual(refs_of(self.tmp / "src"), self.origin_before)
+
+    def test_report_is_byte_identical_to_a_build_without_the_flag(self):
+        """Emitting a branch changes nothing in the report."""
+        self.assertNotIn("emitted", self.plain)
+        self.assertEqual(audit.render(self.cfg, self.res), audit.render(self.cfg, self.plain))
+
+    def test_emitted_commit_is_reproducible(self):
+        """Fixed merge identity and dates give the same commit from two builds into two clones."""
+        self.assertEqual(self.res["emitted"]["commit"], self.again["emitted"]["commit"])
+        self.assertEqual(sh(self.users[1], "git", "rev-parse", "refs/heads/integration"), self.res["emitted"]["commit"])
+
+    def test_existing_branch_stops_the_build_before_any_test(self):
+        """An existing ref of that name is never overwritten: the build stops before it starts."""
+        before = refs_of(self.users[0])
+        with self.assertRaises(SystemExit) as stop:
+            build(self.cfg, self.snap, self.bundle, self.tmp, "c", emit_branch="refs/heads/integration",
+                  emit_repo=self.users[0])
+        self.assertIn("already exists", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-c").exists())
+        self.assertFalse((self.tmp / "c.json").exists())
+        self.assertEqual(refs_of(self.users[0]), before)
+
+    def test_bad_arguments_stop_the_build_before_any_test(self):
+        """A missing or non-git repository, or a ref that is not a full branch name, stops the build early."""
+        cases = [(None, "refs/heads/x", "needs --emit-repo"), (self.tmp, "refs/heads/x", "not a git repository"),
+                 (self.users[0], "integration", "full branch name"), (self.users[0], "refs/heads/a..b", "full branch name")]
+        for repo, ref, message in cases:
+            with self.assertRaises(SystemExit) as stop:
+                build(self.cfg, self.snap, self.bundle, self.tmp, "d", emit_branch=ref, emit_repo=repo)
+            self.assertIn(message, str(stop.exception.code))
+            self.assertFalse((self.tmp / "work-d").exists())
+
+    def test_a_branch_git_refuses_at_the_end_keeps_the_results(self):
+        """If git refuses the ref after the build (here a clashing `x/y`), the results are written without it."""
+        user = self.tmp / "user-c"
+        sh(self.tmp, "git", "clone", "-q", str(self.tmp / "src"), str(user))
+        sh(user, "git", "branch", "x/y")
+        with self.assertRaises(SystemExit) as stop:
+            build(self.cfg, self.snap, self.bundle, self.tmp, "e", emit_branch="refs/heads/x", emit_repo=user)
+        self.assertIn("was not created", str(stop.exception.code))
+        self.assertNotIn("emitted", json.loads((self.tmp / "e.json").read_text()))
 
 
 def small_project(tmp, base_test, status, base_files=None, pr_test=None, pr_files=None, **cfg):
