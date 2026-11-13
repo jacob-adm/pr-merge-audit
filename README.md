@@ -179,6 +179,22 @@ The results file also records the measured time of every run under `timing`, by 
 the count, total, median and maximum seconds, and the wall-clock time of the sequential build
 and of the follow-ups.
 
+### Serial landing, for comparison
+
+Landing the same PRs one at a time costs more. N is the number of PRs tried (merged or not).
+Landing them serially, every PR still open is re-tested after each landing, so the runs are
+N + (N - 1) + ... + 1 = N(N+1)/2. The report states N, that count and the runs this build
+counted. It gives no times, so it stays the same from build to build.
+
+`estimate` gives the same comparison in hours, from the reference build's measured times: the
+N(N+1)/2 runs times the median run of its sequential build in machine-hours, N times that median
+as the hours to land them (each landing waits for one run), and the reference build's own runs
+and wall-clock time. The sequential median is used because each of its runs is the full suite
+on the base plus the PRs merged so far, which is what a serial landing tests; swap tests run
+only for conflicting PRs, culprit searches test partial builds and probes run a single file.
+Both are estimates: they assume every PR stays until it lands and every run takes the median
+time. A reference without `timing` gets the run count only.
+
 ### A measured build
 
 One full build of a Python project with 111 open PRs, on a 14-core laptop

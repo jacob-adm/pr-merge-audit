@@ -451,6 +451,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("### Result: no PRs were eligible to try", text)
         self.assertIn("#1 (failure)", text)
         self.assertNotIn("(0)", text)
+        self.assertNotIn("Serial landing", text)
         self.assertNotIn("\n\n\n", text)
 
     def test_ignore_status_is_applied_and_shown(self):
@@ -519,6 +520,20 @@ class SmallBuilds(unittest.TestCase):
         text = audit.render(cfg, res)
         self.assertIn("**Flaky (failed, then passed on re-run):** #1.", text)
         self.assertNotIn("no single culprit", text)
+
+    def test_estimate_prints_serial_landing_from_the_reference_timing(self):
+        """`estimate` prints the serial-landing hours computed from the reference build's measured times."""
+        import contextlib
+        import io
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        ref = build(cfg, snap, bundle, self.tmp, "ref")
+        args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), reference=str(self.tmp / "ref.json"),
+                                  work=str(self.tmp / "work-estimate"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            audit.cmd_estimate(cfg, args)
+        self.assertIn("\n".join(audit.serial_landing(ref)) + "\n", out.getvalue())
+        self.assertIn("N = 1 tried PRs (estimate): N(N+1)/2 = 1 full runs\n  1 runs x median sequential run", out.getvalue())
 
     def test_environment_line_names_python_only_when_used(self):
         """The report names a Python version only if a command uses Python."""
@@ -696,6 +711,34 @@ class Helpers(unittest.TestCase):
         text = audit.render({}, res)
         self.assertIn(f"**#{a}:** the swap test could not run (`RuntimeError: boom`).", text)
         self.assertIn(f"**Culprit search could not run:** #{b} (`RuntimeError: bang`).", text)
+
+    def test_serial_landing_in_the_report_is_counts_only(self):
+        """The report gives N, N(N+1)/2 runs and this build's runs, and no times, so it stays deterministic."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        text = audit.render({}, res)
+        self.assertIn("landing the N = 6 PRs tried here one at a time, re-testing every PR still open after each "
+                      "landing, would take N(N+1)/2 = 21 full test-suite runs, against the 19 this build counted "
+                      "(1.1 times as many).", text)
+        # Measured times, however different, never reach the report.
+        res["timing"] = {"run_seconds": {"sequence": {"count": 8, "median": 123.45}}, "wall_seconds": {"total": 9876.5}}
+        self.assertEqual(audit.render({}, res), text)
+
+    def test_serial_landing_hours_use_the_sequential_median(self):
+        """`estimate` gives N(N+1)/2 x the sequential median in machine-hours, N x it to land, and the wall clock."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        res["timing"] = {"run_seconds": {"sequence": {"median": 120.0}, "swap": {"median": 999.0}},
+                         "wall_seconds": {"total": 7200.0}}
+        self.assertEqual(audit.serial_landing(res), [
+            "serial landing of the reference build's N = 6 tried PRs (estimate): N(N+1)/2 = 21 full runs",
+            "  21 runs x median sequential run 120.0 s  ~0.7 machine-hours",
+            "  N x 120.0 s, one run per landing     ~0.2 hours to land them",
+            "  the reference build itself: 19 runs, 2.0 hours wall clock"])
+
+    def test_serial_landing_without_timing_invents_no_time(self):
+        """Results from before timing was recorded give the run count and no hours."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        self.assertNotIn("timing", res)
+        self.assertEqual(audit.serial_landing(res)[1:], ["  the reference results record no run times, so no time is estimated"])
 
     def test_empty_blockers_render_in_words(self):
         """A swap with no blockers is described in words, not as an empty list."""

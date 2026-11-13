@@ -1381,6 +1381,16 @@ def render(cfg, res):
           f"parallel workers. Running time scales with the time one test-suite run takes on the "
           f"machine used.")
         w("")
+    # Serial-landing comparison, in counts only, so the report stays deterministic. N is the number
+    # of PRs tried: landing them one at a time, every PR still open is re-tested after each landing,
+    # so the runs are N + (N - 1) + ... + 1 = N(N+1)/2. `estimate` turns this into hours.
+    if tried:
+        serial = tried * (tried + 1) // 2
+        vs = f", against the {total} this build counted ({serial / total:.1f} times as many)" if runs and total else ""
+        w(f"**Serial landing (estimate):** landing the N = {tried} PRs tried here one at a time, re-testing "
+          f"every PR still open after each landing, would take N(N+1)/2 = {serial} full test-suite runs{vs}. "
+          f"The `estimate` command converts these counts to hours using a build's measured run times.")
+        w("")
     # Closing caveat on what the results prove.
     w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
     return "\n".join(L) + "\n"
@@ -1443,6 +1453,34 @@ def cmd_estimate(cfg, args):
     print(f"  sequential build  ~{seq / 60:.0f} min")
     print(f"  follow-up jobs    ~{rest / 60:.0f} min on {cfg['workers']} workers")
     print(f"  total             ~{(seq + rest) / 60:.0f} min (merges and bisection rebuilds add some more)")
+    # Landing the reference build's tried PRs one at a time instead, from its own measured times.
+    for line in serial_landing(ref):
+        print(line)
+
+
+def serial_landing(res):
+    """Lines estimating serial landing of a results file's tried PRs, from its measured run times.
+
+    Machine-dependent, so it is printed by `estimate` and never put in the report.
+    """
+    # N is the number of PRs tried; every PR still open is re-tested after each landing.
+    n = len(res["order"])
+    serial = n * (n + 1) // 2
+    lines = [f"serial landing of the reference build's N = {n} tried PRs (estimate): N(N+1)/2 = {serial} full runs"]
+    # The sequential median: each of those runs is the full suite on the base plus the PRs merged so far.
+    timing = res.get("timing", {})
+    med = timing.get("run_seconds", {}).get("sequence", {}).get("median")
+    if not med:
+        return lines + ["  the reference results record no run times, so no time is estimated"]
+    lines.append(f"  {serial} runs x median sequential run {med} s  ~{serial * med / 3600:.1f} machine-hours")
+    lines.append(f"  N x {med} s, one run per landing     ~{n * med / 3600:.1f} hours to land them")
+    # The reference build's own cost, as measured, for comparison.
+    wall = timing.get("wall_seconds", {}).get("total")
+    runs = res.get("test_runs", {})
+    counted = sum(runs.get(k, 0) for k in ("sequence", "swap", "culprit", "probe"))
+    lines.append(f"  the reference build itself: {counted} runs, {wall / 3600:.1f} hours wall clock" if wall
+                 else f"  the reference build itself: {counted} runs")
+    return lines
 
 
 def main():

@@ -57,4 +57,6 @@ Each pair merged onto `main` alone:
 
 **Test-suite runs:** 19 in total: 8 for the sequential build, 1 for swap tests, 8 for culprit searches and 2 for probes. The sequential build runs one at a time; the rest ran on 2 parallel workers. Running time scales with the time one test-suite run takes on the machine used.
 
+**Serial landing (estimate):** landing the N = 6 PRs tried here one at a time, re-testing every PR still open after each landing, would take N(N+1)/2 = 21 full test-suite runs, against the 19 this build counted (1.1 times as many). The `estimate` command converts these counts to hours using a build's measured run times.
+
 Tests passing only shows that the PRs combine. It doesn't show each fix is correct.
