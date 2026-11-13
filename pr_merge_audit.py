@@ -980,8 +980,9 @@ def check_emit(args, snap):
         sys.exit(f"--emit-branch {ref} is a symbolic ref to {symref(gitdir, ref)} in {gitdir}; choose another name")
     # Dry run of the final write: lock the ref, requiring that it does not exist, then let go. This
     # catches an existing ref and a clash with a directory or file of refs (`x` versus `x/y`).
-    probe = git(gitdir, "update-ref", "--stdin", check=False,
-                data=f"start\nverify {ref} {'0' * len(snap['base_sha'])}\nprepare\nabort\n")
+    # NUL-separated (-z): text-mode pipes on Windows turn "\n" into "\r\n", which git would reject.
+    probe = git(gitdir, "update-ref", "--stdin", "-z", check=False,
+                data=f"start\0verify {ref}\0{'0' * len(snap['base_sha'])}\0prepare\0abort\0")
     if probe.returncode:
         sys.exit(f"--emit-branch {ref} cannot be created in {gitdir}: {probe.stderr.strip()}")
     return gitdir
