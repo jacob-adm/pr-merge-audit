@@ -12,6 +12,7 @@ Needs only the Python standard library (3.8+) and git (2.38+, for `git merge-tre
 
     pr_merge_audit.py --config config.json snapshot                                # network: freeze PR heads
     pr_merge_audit.py --config config.json build --snapshot snapshots/DATE.json    # offline; runs PR code
+        [--emit-branch refs/heads/NAME --emit-repo CLONE]                          # keep the merged build as a branch
     pr_merge_audit.py report --results results/DATE.json [--out report.md]
     pr_merge_audit.py verify --results results/DATE.json --golden report.md
 
@@ -42,7 +43,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PureWindowsPath
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 # Fixed identity, dates and config for every git call, so merge commits (and therefore
 # results) are reproducible and the operator's own git configuration never applies.
@@ -192,18 +193,19 @@ def remove_tree(path, strict=False):
             raise
 
 
-def git(repo, *args, check=True, binary=False):
+def git(repo, *args, check=True, binary=False, data=None, env=None):
     """Run git in `repo` with the fixed environment; raise on failure unless `check` is False.
 
     Hooks and filesystem monitors are disabled, so repository content cannot run code here.
+    `data` is sent to standard input; `env` replaces the fixed environment for that one call.
     """
-    # Minimal environment plus the fixed git identity.
-    env = dict(base_env(), **GIT_ENV)
+    # Minimal environment plus the fixed git identity, unless the caller supplies one.
+    env = env or dict(base_env(), **GIT_ENV)
     # gc.auto=0: parallel jobs merge in worktrees of one repository; a background gc must not race them.
     argv = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false", "-c", "gc.auto=0", *args]
     text = {} if binary else {"encoding": "utf-8", "errors": "replace"}  # not the locale's code page
     # Capture output; raise with git's own message when the command fails and `check` is set.
-    r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, **text)
+    r = subprocess.run(argv, cwd=repo, env=env, capture_output=True, input=data, **text)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
     return r
@@ -939,6 +941,79 @@ def timing_summary(wall, seconds):
             "run_seconds": {k: stats(v) for k, v in seconds.items()}}
 
 
+def check_emit(args, snap):
+    """Validate `--emit-branch` and `--emit-repo` before any work; return the receiving git directory.
+
+    The build's own repository is private and deleted afterwards, so the branch must go into a
+    repository the operator names. Every refusal git would make when the branch is written at the
+    end is checked here, so a long build is not wasted. Returns None when no branch is to be emitted.
+    """
+    # A repository without a branch to put in it is a usage mistake, not something to ignore.
+    if args.emit_repo and not args.emit_branch:
+        sys.exit("usage: --emit-repo needs --emit-branch, the branch to create there")
+    # Nothing to check unless a branch was asked for.
+    if not args.emit_branch:
+        return None
+    # The receiving repository is never guessed: it must be named explicitly.
+    if not args.emit_repo:
+        sys.exit("usage: --emit-branch needs --emit-repo, the local git repository that receives the branch")
+    path = Path(args.emit_repo).resolve()
+    if not path.is_dir():
+        sys.exit(f"--emit-repo {path}: no such directory")
+    # Resolve to the repository's git directory, as `git -C PATH` would find it; show git's own reason
+    # (not a repository, a safe.directory refusal, ...) when it cannot.
+    found = git(path, "rev-parse", "--absolute-git-dir", check=False)
+    if found.returncode:
+        sys.exit(f"--emit-repo {path}: {found.stderr.strip()}")
+    gitdir = found.stdout.strip()
+    ref = args.emit_branch
+    # Only a full, well-formed branch name, so the ref written is exactly the one given.
+    if not ref.startswith("refs/heads/") or git(gitdir, "check-ref-format", ref, check=False).returncode:
+        sys.exit(f"--emit-branch {ref}: give a full branch name, such as refs/heads/integration")
+    # The snapshot's commits must be storable there: SHA-1 ids cannot go into a SHA-256 repository.
+    want = "sha256" if len(snap["base_sha"]) == 64 else "sha1"
+    have = git(gitdir, "rev-parse", "--show-object-format").stdout.strip()
+    if have != want:
+        sys.exit(f"--emit-repo {gitdir} uses {have} object ids, but the snapshot uses {want}")
+    # A symbolic ref, even one pointing nowhere, would make git write a different branch.
+    if symref(gitdir, ref):
+        sys.exit(f"--emit-branch {ref} is a symbolic ref to {symref(gitdir, ref)} in {gitdir}; choose another name")
+    # Dry run of the final write: lock the ref, requiring that it does not exist, then let go. This
+    # catches an existing ref and a clash with a directory or file of refs (`x` versus `x/y`).
+    # NUL-separated (-z): text-mode pipes on Windows turn "\n" into "\r\n", which git would reject.
+    probe = git(gitdir, "update-ref", "--stdin", "-z", check=False,
+                data=f"start\0verify {ref}\0{'0' * len(snap['base_sha'])}\0prepare\0abort\0")
+    if probe.returncode:
+        sys.exit(f"--emit-branch {ref} cannot be created in {gitdir}: {probe.stderr.strip()}")
+    return gitdir
+
+
+def symref(gitdir, ref):
+    """What `ref` points to if it is a symbolic ref in `gitdir`, else None; writing it would write that."""
+    target = git(gitdir, "symbolic-ref", "-q", ref, check=False)
+    return None if target.returncode else target.stdout.strip()
+
+
+def caller_env():
+    """The caller's environment without GIT_* variables: their own identity and the current time."""
+    return dict({k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, GIT_TERMINAL_PROMPT="0")
+
+
+def emit_branch(ws, gitdir, ref, tip):
+    """Create branch `ref` at `tip` in the repository at `gitdir`; nothing is pushed or overwritten."""
+    # Name the tip inside the private workspace, so it can be fetched from there.
+    git(ws.repo, "update-ref", "refs/audit/emit", tip)
+    # Copy its commits into the receiving repository; no remote, tag or FETCH_HEAD is touched.
+    git(gitdir, "fetch", "-q", "--no-tags", "--no-write-fetch-head", str(ws.repo), "refs/audit/emit")
+    # The ref may have become a symbolic ref during the build; check again right before writing.
+    if symref(gitdir, ref):
+        raise RuntimeError(f"{ref} is now a symbolic ref to {symref(gitdir, ref)}")
+    # Create the branch; the empty old value makes git refuse if the ref exists by now. The reflog
+    # entry carries the operator's own identity and the real time, not the fixed merge identity;
+    # the commit itself, and so its id, are unchanged.
+    git(gitdir, "update-ref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
+
+
 def cmd_build(cfg, args):
     """`build` command: merge-test the snapshot offline and write the results file.
 
@@ -946,9 +1021,10 @@ def cmd_build(cfg, args):
     culprit searches, probes). Runs PR code; see SECURITY.md.
     """
     check_git()
-    # Load the snapshot and validate probes before doing any work.
+    # Load the snapshot and validate probes and the branch to emit before doing any work.
     snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
     check_probes(cfg, snap)
+    emit_to = check_emit(args, snap)
     # The bundle sits next to the snapshot unless given explicitly.
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
     print("note: this runs code from every PR it tries; use a disposable machine without credentials",
@@ -1049,12 +1125,31 @@ def cmd_build(cfg, args):
         "timing": timing_summary({"total": follow_ups_done - started, "sequence": sequence_done - started,
                                   "follow_ups": follow_ups_done - sequence_done}, ws.seconds),
     }
+    # Optionally keep the sequential build's tip as a branch, with a manifest of what it holds.
+    # The manifest is a results key the report never reads, so the report is unchanged.
+    emit_error = None
+    if emit_to:
+        try:
+            emit_branch(ws, emit_to, args.emit_branch, tip)
+            results["emitted"] = {
+                "repo": emit_to, "ref": args.emit_branch, "commit": tip,
+                "included": [m["pr"] for m in merged],
+                "excluded": [{"pr": s["pr"], "reason": s["outcome"]} for s in held]
+                + [{"pr": r["pr"], "reason": "not tried: " + r["reason"]} for r in not_tried],
+            }
+        except RuntimeError as exc:  # the results are still worth keeping
+            emit_error = str(exc)
     # Write the results file and clear the workspace.
     out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     write_text(out, json.dumps(results, indent=1, sort_keys=True) + "\n")
     remove_tree(ws.work)
     print(f"wrote {out}")
+    # Say where the branch went, or why it was not created.
+    if emit_error:
+        sys.exit(f"{args.emit_branch} was not created: {emit_error}")
+    if emit_to:
+        print(f"created {args.emit_branch} at {tip[:7]} in {emit_to}")
 
 
 # ---------------------------------------------------------------- report
@@ -1373,6 +1468,9 @@ def main():
     b.add_argument("--out")
     b.add_argument("--ignore-status", action="store_true",
                    help="try PRs whatever their required status check says (shown in the report)")
+    b.add_argument("--emit-branch", metavar="REF",
+                   help="create branch REF (e.g. refs/heads/integration) at the merged, passing build; never overwrites")
+    b.add_argument("--emit-repo", metavar="PATH", help="local git repository that receives --emit-branch; nothing is pushed")
     # report: render a results file as Markdown.
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)

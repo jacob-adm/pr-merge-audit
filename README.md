@@ -44,6 +44,8 @@ or run `python3 pr_merge_audit.py` from a clone; it has no dependencies. The com
 ```
 python3 pr_merge_audit.py --config PROJECT/config.json snapshot   # freeze PR heads and metadata
 python3 pr_merge_audit.py --config PROJECT/config.json build --snapshot snapshots/DATE.json   # offline
+python3 pr_merge_audit.py --config PROJECT/config.json build --snapshot snapshots/DATE.json \
+    --emit-branch refs/heads/integration --emit-repo PATH/TO/CLONE   # also keep the merged build as a branch
 python3 pr_merge_audit.py report --results results/DATE.json --out reports/DATE.md
 python3 pr_merge_audit.py verify --results results/DATE.json --golden reports/DATE.md
 python3 pr_merge_audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json \
@@ -79,6 +81,38 @@ Merge commits use a fixed identity and timestamp, global and system git config a
 and tests run with a fixed locale, time zone and hash seed, a private `HOME` and `TMPDIR`, and
 none of the caller's environment variables other than `PATH` (plus proxy and certificate settings)
 and those listed in `pass_env`.
+
+## Keeping the merged build as a branch
+
+`build --emit-branch REF --emit-repo PATH` keeps the result of the sequential build: a new branch
+`REF` at its last commit, which is the base with every PR that merged and passed, merged in the
+configured order. Land it as one pull request instead of landing the PRs one by one.
+
+- **Which repository.** The build runs in a private repository loaded from the snapshot bundle and
+  deleted at the end, so the branch goes to the local git repository at `PATH` (found as
+  `git -C PATH` would), usually your clone of the project. Nothing else receives it.
+- **What is written there.** The commits the branch needs, the one ref `REF`, and that ref's
+  reflog entry, which carries your own git identity and the current time (the commits keep the
+  fixed merge identity). No remote, tag, `FETCH_HEAD` or other ref changes, and nothing is
+  pushed: push the branch yourself when you are ready.
+- **Checked before the build.** The two flags go together. `REF` must be a full branch name
+  (`refs/heads/...`) that is not a symbolic ref, and `PATH` must use the snapshot's object format
+  (SHA-1 or SHA-256). A dry run of the final write, which locks `REF` and lets it go, finds an
+  existing branch of that name and clashes such as `x` beside `x/y`. Any of these stops the build
+  before any test runs, with git's own message where git gave one.
+- **Never overwrites.** The write itself requires that `REF` still does not exist and is not a
+  symbolic ref. If either has changed during the build, the results are written without the
+  branch and the build exits with an error.
+- **Manifest.** The results file gains an `emitted` key: the repository's git directory, the
+  ref, the commit, the PRs included (in merge order) and every PR excluded with its reason
+  (`conflict`, `fail` or `flaky` for PRs that were tried, `not tried: ...` for the rest). The
+  report does not read it, so it is byte-identical to that of a build without the flag.
+- **Reproducible.** Merge commits use a fixed identity and timestamp, so the same snapshot,
+  configuration and test outcomes give the same commit id.
+
+Swap tests, culprit searches and probes do not change the branch. A PR that conflicts and
+passes once swapped in is excluded: it conflicts with a PR on the branch, so it cannot join as it is.
+If no PR merged, the branch is the base itself.
 
 ## Security
 
@@ -214,7 +248,7 @@ python3 -m unittest discover -s tests
 tool on them (no mocks): merge, conflict and swap, a cross-PR test failure found by bisection, a
 PR that fails on the base alone, the not-tried reasons, probes, run counts, determinism across
 two builds, test isolation from `.git`, archive and probe containment, hidden and early-exiting
-tests, background processes, report escaping, output capping, the work-directory marker and
+tests, the emitted branch and its manifest, background processes, report escaping, output capping, the work-directory marker and
 token handling on redirects. It also checks the golden report. The suite takes a few seconds.
 
 ## Self-check
