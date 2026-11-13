@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pr-merge-audit"
-version = "1.0.1"
+version = "1.1.0"
 description = "Merge-test a repository's open pull requests together and report which combine, conflict or break each other's tests."
 readme = "README.md"
 license = { text = "Apache-2.0" }

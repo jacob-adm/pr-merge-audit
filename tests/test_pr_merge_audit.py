@@ -285,6 +285,14 @@ class EmitBranch(unittest.TestCase):
         added = set(refs_of(self.users[0]).splitlines()) - set(self.user_before.splitlines())
         self.assertEqual(added, {"refs/heads/integration " + self.res["emitted"]["commit"]})
         self.assertEqual(refs_of(self.tmp / "src"), self.origin_before)
+        self.assertFalse((self.users[0] / ".git" / "FETCH_HEAD").exists())
+
+    def test_reflog_entry_has_the_callers_identity_and_time(self):
+        """The new branch's reflog is not stamped with the fixed merge identity or its 2000-01-01 date."""
+        log = (self.users[0] / ".git" / "logs" / "refs" / "heads" / "integration").read_text()
+        self.assertIn("pr-merge-audit build", log)
+        self.assertNotIn("audit@localhost", log)
+        self.assertNotIn(" 946684800 ", log)
 
     def test_report_is_byte_identical_to_a_build_without_the_flag(self):
         """Emitting a branch changes nothing in the report."""
@@ -307,25 +315,89 @@ class EmitBranch(unittest.TestCase):
         self.assertFalse((self.tmp / "c.json").exists())
         self.assertEqual(refs_of(self.users[0]), before)
 
-    def test_bad_arguments_stop_the_build_before_any_test(self):
-        """A missing or non-git repository, or a ref that is not a full branch name, stops the build early."""
-        cases = [(None, "refs/heads/x", "needs --emit-repo"), (self.tmp, "refs/heads/x", "not a git repository"),
-                 (self.users[0], "integration", "full branch name"), (self.users[0], "refs/heads/a..b", "full branch name")]
-        for repo, ref, message in cases:
-            with self.assertRaises(SystemExit) as stop:
-                build(self.cfg, self.snap, self.bundle, self.tmp, "d", emit_branch=ref, emit_repo=repo)
-            self.assertIn(message, str(stop.exception.code))
-            self.assertFalse((self.tmp / "work-d").exists())
-
-    def test_a_branch_git_refuses_at_the_end_keeps_the_results(self):
-        """If git refuses the ref after the build (here a clashing `x/y`), the results are written without it."""
-        user = self.tmp / "user-c"
-        sh(self.tmp, "git", "clone", "-q", str(self.tmp / "src"), str(user))
-        sh(user, "git", "branch", "x/y")
+    def stops_early(self, ref, repo, message):
+        """Assert that building with `ref` into `repo` stops before any test with `message`; return the message."""
         with self.assertRaises(SystemExit) as stop:
-            build(self.cfg, self.snap, self.bundle, self.tmp, "e", emit_branch="refs/heads/x", emit_repo=user)
+            build(self.cfg, self.snap, self.bundle, self.tmp, "d", emit_branch=ref, emit_repo=repo)
+        self.assertIn(message, str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-d").exists())
+        self.assertFalse((self.tmp / "d.json").exists())
+        return str(stop.exception.code)
+
+    def clone(self, name):
+        """A fresh clone of the fixture repository, standing for another operator clone."""
+        user = self.tmp / name
+        sh(self.tmp, "git", "clone", "-q", str(self.tmp / "src"), str(user))
+        return user
+
+    def test_bad_arguments_stop_the_build_before_any_test(self):
+        """Either flag without the other, a non-git directory or a ref that is not a full branch name stops early."""
+        self.stops_early("refs/heads/x", None, "needs --emit-repo")
+        self.stops_early(None, self.users[0], "needs --emit-branch")
+        self.stops_early("refs/heads/x", self.tmp / "missing", "no such directory")
+        self.stops_early("refs/heads/x", self.tmp, "fatal: not a git repository")  # git's own words
+        self.stops_early("integration", self.users[0], "full branch name")
+        self.stops_early("refs/heads/a..b", self.users[0], "full branch name")
+
+    def test_ref_clashes_stop_the_build_before_any_test(self):
+        """A ref git would refuse at the end (`x` beside `x/y`, or `main/z` under `main`) is refused up front."""
+        user = self.clone("user-c")
+        sh(user, "git", "branch", "x/y")
+        self.assertIn("'refs/heads/x/y' exists", self.stops_early("refs/heads/x", user, "cannot be created"))
+        self.assertIn("'refs/heads/main' exists", self.stops_early("refs/heads/main/z", user, "cannot be created"))
+
+    def test_symbolic_ref_stops_the_build_before_any_test(self):
+        """A dangling symbolic ref is refused, so git never creates the branch it points to instead."""
+        user = self.clone("user-s")
+        sh(user, "git", "symbolic-ref", "refs/heads/s", "refs/heads/elsewhere")
+        self.stops_early("refs/heads/s", user, "symbolic ref to refs/heads/elsewhere")
+        self.assertNotIn("refs/heads/elsewhere", refs_of(user))
+
+    def test_other_object_format_stops_the_build_before_any_test(self):
+        """A SHA-256 repository cannot hold the snapshot's SHA-1 commits; that is found before the build."""
+        user = self.tmp / "user-256"
+        sh(self.tmp, "git", "init", "-q", "--object-format=sha256", str(user))
+        self.stops_early("refs/heads/integ", user, "uses sha256 object ids, but the snapshot uses sha1")
+
+    def workspace(self):
+        """A real build workspace loaded from the fixture's bundle, removed after the test."""
+        ws = audit.Workspace(self.cfg, json.loads(self.snap.read_text()), self.bundle, self.tmp / "work-ws")
+        self.addCleanup(audit.remove_tree, ws.work)
+        return ws
+
+    def test_ref_created_after_the_check_is_not_overwritten(self):
+        """If the ref appears between the check and the write, git refuses and the ref keeps its commit."""
+        user, ws = self.clone("user-o"), self.workspace()
+        args = argparse.Namespace(emit_branch="refs/heads/late", emit_repo=str(user))
+        gitdir = audit.check_emit(args, json.loads(self.snap.read_text()))
+        sh(user, "git", "branch", "late", ws.base)
+        with self.assertRaises(RuntimeError):
+            audit.emit_branch(ws, gitdir, "refs/heads/late", ws.heads[1])
+        self.assertEqual(sh(user, "git", "rev-parse", "refs/heads/late"), ws.base)
+
+    def test_ref_turned_symbolic_after_the_check_is_refused(self):
+        """If the ref becomes a dangling symbolic ref during the build, the write is refused and nothing created."""
+        user, ws = self.clone("user-t"), self.workspace()
+        args = argparse.Namespace(emit_branch="refs/heads/t", emit_repo=str(user))
+        gitdir = audit.check_emit(args, json.loads(self.snap.read_text()))
+        sh(user, "git", "symbolic-ref", "refs/heads/t", "refs/heads/elsewhere")
+        with self.assertRaises(RuntimeError) as err:
+            audit.emit_branch(ws, gitdir, "refs/heads/t", ws.heads[1])
+        self.assertIn("symbolic ref", str(err.exception))
+        self.assertNotIn("refs/heads/elsewhere", refs_of(user))
+
+    def test_a_late_refusal_keeps_the_results(self):
+        """A ref created during the build (here by the setup command) is refused; results are written without it."""
+        user = self.clone("user-l")
+        base = json.loads(self.snap.read_text())["base_sha"]
+        make_ref = f"import subprocess; subprocess.run(['git', '-C', {str(user)!r}, 'update-ref', 'refs/heads/late', {base!r}])"
+        cfg = dict(self.cfg, setup_cmd=["{python}", "-c", make_ref])
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, self.snap, self.bundle, self.tmp, "e", emit_branch="refs/heads/late", emit_repo=user)
         self.assertIn("was not created", str(stop.exception.code))
+        self.assertEqual(json.loads((self.tmp / "e.json").read_text())["merged"], [1, 3])
         self.assertNotIn("emitted", json.loads((self.tmp / "e.json").read_text()))
+        self.assertEqual(sh(user, "git", "rev-parse", "refs/heads/late"), base)
 
 
 def small_project(tmp, base_test, status, base_files=None, pr_test=None, pr_files=None, **cfg):

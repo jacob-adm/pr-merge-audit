@@ -91,12 +91,18 @@ configured order. Land it as one pull request instead of landing the PRs one by 
 - **Which repository.** The build runs in a private repository loaded from the snapshot bundle and
   deleted at the end, so the branch goes to the local git repository at `PATH` (found as
   `git -C PATH` would), usually your clone of the project. Nothing else receives it.
-- **What is written there.** The commits the branch needs, and the one ref `REF`. No remote,
-  tag, `FETCH_HEAD` or other ref changes, and nothing is pushed: push the branch yourself when
-  you are ready.
-- **Never overwrites.** `REF` must be a full branch name (`refs/heads/...`) that does not exist yet.
-  An existing branch of that name stops the build before any test runs. If git still refuses the
-  branch at the end, the results are written without it and the build exits with an error.
+- **What is written there.** The commits the branch needs, the one ref `REF`, and that ref's
+  reflog entry, which carries your own git identity and the current time (the commits keep the
+  fixed merge identity). No remote, tag, `FETCH_HEAD` or other ref changes, and nothing is
+  pushed: push the branch yourself when you are ready.
+- **Checked before the build.** The two flags go together. `REF` must be a full branch name
+  (`refs/heads/...`) that is not a symbolic ref, and `PATH` must use the snapshot's object format
+  (SHA-1 or SHA-256). A dry run of the final write, which locks `REF` and lets it go, finds an
+  existing branch of that name and clashes such as `x` beside `x/y`. Any of these stops the build
+  before any test runs, with git's own message where git gave one.
+- **Never overwrites.** The write itself requires that `REF` still does not exist and is not a
+  symbolic ref. If either has changed during the build, the results are written without the
+  branch and the build exits with an error.
 - **Manifest.** The results file gains an `emitted` key: the repository's git directory, the
   ref, the commit, the PRs included (in merge order) and every PR excluded with its reason
   (`conflict`, `fail` or `flaky` for PRs that were tried, `not tried: ...` for the rest). The
