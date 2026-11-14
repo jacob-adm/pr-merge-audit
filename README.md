@@ -32,7 +32,7 @@ the two snapshot files yourself and run `build` on them:
 ## Install
 
 ```
-pip install git+https://github.com/jacob-adm/pr-merge-audit
+pip install pr-merge-audit
 pr-merge-audit --help
 ```
 

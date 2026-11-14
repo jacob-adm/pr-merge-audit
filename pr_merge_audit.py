@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Fixed identity, dates and config for every git call, so merge commits (and therefore
 # results) are reproducible and the operator's own git configuration never applies.
