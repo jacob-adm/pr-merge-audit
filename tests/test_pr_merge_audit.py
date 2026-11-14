@@ -710,6 +710,74 @@ class NonMonotoneCulprit(unittest.TestCase):
         self.assertIn("bisection pointed at #4, but that pair passes alone:** #5", report)
 
 
+class Hardening(unittest.TestCase):
+    """Config mistakes stop at load; report text from config is escaped; failed exports leave no process."""
+    def setUp(self):
+        """Fresh temporary directory per test."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        """Remove the temporary directory."""
+        self._tmp.cleanup()
+
+    def test_bad_config_values_stop_at_load(self):
+        """Each malformed value is refused when the config is loaded, naming the key."""
+        good = dict(UNITTEST, repo="local/test", base="main")
+        cases = {
+            "test_cmd must be": dict(good, test_cmd="python -m unittest"),
+            "test_cmd must be ": dict(good, test_cmd=["python", 3]),
+            "cmd must be": dict(good, probes=[{"name": "p", "file": "p.py", "cmd": [None], "targets": ["base"]}]),
+            "workers must be": dict(good, workers=0),
+            "workers must be ": dict(good, workers=True),
+            "test_timeout must be": dict(good, test_timeout=-1),
+            "count_pattern needs a capturing group": dict(good, count_pattern=r"^Ran \d+"),
+            "failure_pattern is not a valid": dict(good, failure_pattern="(unclosed"),
+        }
+        config = self.tmp / "config.json"
+        for message, data in cases.items():
+            with self.subTest(message=message):
+                config.write_text(json.dumps(data))
+                with self.assertRaises(SystemExit) as stop:
+                    audit.load_config(str(config))
+                self.assertIn(message.strip(), str(stop.exception.code))
+        config.write_text(json.dumps(good))
+        self.assertEqual(audit.load_config(str(config))["workers"], 4)
+
+    def test_config_text_cannot_change_report_structure(self):
+        """A probe name or exclusion reason with Markdown stays one table cell or one list item."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        res["probes"][0]["probe"] = "x | injected | cell\n### Heading"
+        for row in res["not_tried"]:
+            if row["reason"] == "excluded":
+                row["detail"] = "see [link](https://example.com) @someone\n- fake item <b>"
+        report = audit.render({}, res)
+        probe_row = next(l for l in report.splitlines() if l.startswith("| x"))
+        self.assertEqual(probe_row.count(" | "), 3, probe_row)  # four cells, as the header has
+        self.assertNotIn("\n### Heading", report)
+        self.assertNotIn("\n- fake item", report)
+        self.assertIn("\\[link\\](https://example.com) \\@someone", report)
+
+    @unittest.skipIf(os.name == "nt", "checks for unreaped children with os.waitpid")
+    def test_failed_extraction_leaves_no_git_process(self):
+        """A file name the file system refuses fails the export, and git archive is stopped and reaped."""
+        src = self.tmp / "src"
+        src.mkdir()
+        git_in(src, "init", "-q")
+        # A name too long for the file system comes first; a large file keeps git archive writing.
+        tree = mktree(src, [("100644", "0" * 300, "x"), ("100644", "big", "y" * (8 << 20))])
+        head = git_in(src, "commit-tree", tree, "-m", "c")
+        git_in(src, "update-ref", "refs/audit/base", head)
+        bundle = self.tmp / "b.bundle"
+        git_in(src, "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        cfg = dict(UNITTEST, python=sys.executable, test_timeout=60)
+        ws = audit.Workspace(cfg, {"base_sha": head, "prs": []}, bundle, self.tmp / "work")
+        with self.assertRaises(OSError):
+            ws.export(head)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(-1, os.WNOHANG)
+
+
 class Packaging(unittest.TestCase):
     """Installation metadata stays consistent with the module."""
     def test_installed_module_and_console_script_use_the_distinctive_name(self):

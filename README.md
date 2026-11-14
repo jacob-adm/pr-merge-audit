@@ -147,6 +147,13 @@ What the tool does to limit damage short of that:
   symlink and no file of that name exists.
 - Each test run gets its own process group, which is killed when the run ends or times out, so
   processes the tests leave in the background stop with it (unless they start their own session).
+  On Windows a job object does the same; if Windows refuses to put the run in one, the tool prints
+  a warning and stops only the test process itself, so its children may survive the run.
+- Probe names and the reasons from `exclude`, `duplicates` and status checks are escaped in the
+  report, so they cannot add table cells, list items, links, mentions or HTML.
+- The config is checked when it is loaded: commands must be non-empty lists of strings, `workers`
+  and `test_timeout` positive numbers, and each output pattern a valid regular expression with a
+  capturing group.
 - Git runs with system and global config ignored, hooks pointed at the null device,
   `core.fsmonitor` off and only `PATH` (plus proxy and certificate settings) taken from your
   environment. Subprocesses never go through a shell. Test runs also get the variables you list in
