@@ -29,6 +29,9 @@ the two snapshot files yourself and run `build` on them:
 - `snapshots/DATE.bundle`: a `git bundle` holding `refs/audit/base` and `refs/audit/pr/N` for
   each PR.
 
+`build` refuses a snapshot whose `base_sha` or a PR's `head` is not a full commit id, that lists a
+PR number twice, or whose ids differ from the bundle's refs, before any test runs.
+
 ## Install
 
 ```
@@ -72,8 +75,11 @@ build can be re-run later even after PR branches move or are deleted.
 3. **Swap test.** For each conflicting PR, the merged PRs it conflicts with pairwise
    (`git merge-tree`) are reverted, the PR is merged in their place, and the tests run.
 4. **Culprit search.** For each PR that fails tests without a text conflict, or still fails after
-   its swap, the merge sequence is bisected to the first PR that makes it fail, and that pair is
-   tested alone on the base.
+   its swap, the merge sequence is bisected for a PR that makes it fail, and that pair is tested
+   alone on the base. Bisection assumes a failure, once it appears, stays as more PRs are merged;
+   a later PR that repairs an earlier interaction can mislead it. The report names a pair as
+   failing only when the pair fails alone; otherwise it lists the PR under Other with the
+   candidate bisection pointed at.
 5. **Probes.** Each file in `probes` is copied into each listed target (the base, or a PR head)
    and run with the probe's own command.
 
@@ -254,7 +260,9 @@ sequence. Treat the follow-up figure as a minimum.
 A probe's `file` (relative to the configuration file) is written to `dest` in the target, by
 default `test_prefix` + `audit_probe_` + its file name, and `cmd` is run there. In `cmd`,
 `{python}`, `{dest}` and `{module}` (`dest` without its suffix, with `.` for `/`) are replaced.
-Targets are `"base"` or PR numbers. Probe output is read with the same patterns as the tests.
+Targets are `"base"` or PR numbers. Probe output is read with the same patterns as the tests. `dest`
+must be a relative path inside the target: an absolute path, a drive or a `..` part stops the
+build before any test runs.
 
 ## Tests
 
