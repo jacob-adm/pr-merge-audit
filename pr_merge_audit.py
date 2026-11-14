@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 __version__ = "1.1.0"
 
@@ -249,6 +249,20 @@ def check_snapshot(snap):
             sys.exit(f"snapshot: PR #{n} head {p.get('head')!r} is not a full commit id like base_sha")
 
 
+def probe_dest(cfg, probe):
+    """Where a probe file goes in the target: its `dest`, or `test_prefix` + `audit_probe_` + its name."""
+    return Path(probe.get("dest") or Path(cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
+
+
+def relative_inside(rel):
+    """Whether `rel` names a file below a directory on every platform: not absolute, no drive, no '..'."""
+    # Judge the path both ways, so a config written on one platform is safe on the other.
+    for pure in (PurePosixPath(str(rel)), PureWindowsPath(str(rel))):
+        if pure.is_absolute() or pure.drive or pure.root or ".." in pure.parts or not pure.parts:
+            return False
+    return True
+
+
 def check_probes(cfg, snap):
     """Stop before any test runs if a probe names a missing file or a target not in the snapshot."""
     # PR numbers in the snapshot, the only valid PR targets.
@@ -259,6 +273,10 @@ def check_probes(cfg, snap):
             sys.exit(f"probe {probe['name']!r}: file {probe['file']} not found next to the config")
         if not probe.get("targets"):
             sys.exit(f"probe {probe['name']!r}: no targets; list \"base\" and/or PR numbers")
+        # The destination must stay inside the tested copy.
+        rel = probe_dest(cfg, probe)
+        if not relative_inside(rel):
+            sys.exit(f"probe {probe['name']!r}: dest {rel.as_posix()!r} must be a relative path inside the target, without '..'")
         # Each target must be the base or a PR in this snapshot.
         for target in probe["targets"]:
             if target != "base" and target not in numbers:
@@ -820,7 +838,12 @@ def build_from(ws, name, prs):
 
 
 def find_culprit(ws, n, seq, name):
-    """First PR in `seq` whose addition makes PR `n` fail its tests, by bisection."""
+    """A candidate for the PR in `seq` whose addition makes PR `n` fail its tests, found by bisection.
+
+    Bisection assumes that once PR `n` fails with a prefix of `seq`, it fails with every longer one.
+    A later PR can repair an earlier interaction, so the candidate is confirmed by testing it with
+    PR `n` alone; `pair` holds that result, and only a failing pair names a culprit in the report.
+    """
     ws.phase("culprit")
     def fails_with(k):
         """Whether PR `n` fails (or conflicts) when merged after the first `k` PRs of `seq`."""
@@ -893,6 +916,9 @@ def swap(ws, n, merged, tip):
 
 def place_probe(root, rel, data):
     """Write the probe file under `root`, refusing symlinks anywhere on the way and existing files."""
+    # Refuse a destination outside `root` before creating anything.
+    if not relative_inside(rel):
+        return f"{rel}: not a relative path inside the target"
     # Create parent directories one by one, refusing any that is a symlink.
     path = root
     for part in Path(rel).parts[:-1]:
@@ -901,6 +927,10 @@ def place_probe(root, rel, data):
             return f"{rel}: a directory on the path is a symlink"
         path.mkdir(exist_ok=True)
     # Exclusive create and no-follow: never overwrite a file or write through a link the PR placed.
+    # The parent, with every link resolved, must still be inside `root`.
+    top = str(root.resolve())
+    if os.path.commonpath([str((root / rel).parent.resolve()), top]) != top:
+        return f"{rel}: resolves outside the target"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(root / rel, flags, 0o644)
@@ -919,7 +949,7 @@ def run_probe(ws, probe, target):
     """
     ws.phase("probe")
     # Where the probe goes in the target, and its dotted module name for test runners that need one.
-    rel = Path(probe.get("dest") or Path(ws.cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
+    rel = probe_dest(ws.cfg, probe)
     module = str(rel.with_suffix("")).replace(os.sep, ".")
     # Resolve the probe command's placeholders.
     argv = fill(probe["cmd"], python=ws.cfg["python"], dest=rel, module=module)
@@ -1192,6 +1222,11 @@ def cmd_build(cfg, args):
 # ---------------------------------------------------------------- report
 
 
+def confirmed(c):
+    """Whether a culprit search's candidate also fails (or conflicts) when merged with the PR alone."""
+    return bool(c.get("culprit")) and c["pair"]["outcome"] not in ("pass", "flaky")
+
+
 def clean(text, table=False):
     """Text from test output, made safe inside a Markdown code span (and a table cell)."""
     # Collapse control characters, neutralise backticks and cap the length.
@@ -1254,7 +1289,7 @@ def render(cfg, res):
     w("- **Swap test:** for each conflicting PR, the merged PR(s) it conflicts with on its own "
       "(`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.")
     w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
-      "its swap, the merge sequence is bisected to the first merged PR that makes it fail; that pair "
+      "its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair "
       "is then merged onto the base alone and tested.")
     # The selection rules in force.
     if rules:
@@ -1325,15 +1360,17 @@ def render(cfg, res):
             w(f"  It also fails on `{snap['base_ref']}` alone.")
         elif c.get("on_base") == "conflict":
             w(f"  It does not merge onto `{snap['base_ref']}` alone.")
-        if c.get("culprit"):
+        if confirmed(c):
             pairs.append((c["culprit"], n, c["pair"]))
+        elif c.get("culprit"):
+            w(f"  Bisection pointed at #{c['culprit']}, but that pair passes alone.")
     if bad_swaps:
         w("")
 
     # Collect culprit pairs from the failures of the sequential build.
     for n in res["order"]:
         c = culprits.get(n)
-        if c and c.get("culprit"):
+        if c and confirmed(c):
             pairs.append((c["culprit"], n, c["pair"]))
     # Section: pairs that merge cleanly but fail their tests together.
     if pairs:
@@ -1359,6 +1396,8 @@ def render(cfg, res):
             other.append(f"- **Fails its own tests on `{snap['base_ref']}`:** #{n} ({code(st.get('failures', []))}).")
         elif c.get("on_base") == "conflict":
             other.append(f"- **Fails in the build and does not merge onto `{snap['base_ref']}` alone:** #{n} ({code(st.get('failures', []))}).")
+        elif c.get("culprit") and not confirmed(c):
+            other.append(f"- **Fails only in the full build; bisection pointed at #{c['culprit']}, but that pair passes alone:** #{n} ({code(st.get('failures', []))}).")
         elif c and not c.get("culprit"):
             other.append(f"- **Fails only in the full build, no single culprit found:** #{n} ({code(st.get('failures', []))}).")
         if st.get("outcome") == "flaky":

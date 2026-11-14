@@ -524,6 +524,17 @@ class SmallBuilds(unittest.TestCase):
         snap.write_text(json.dumps(good))
         self.assertEqual(build(cfg, snap, bundle, self.tmp, "ok")["merged"], [1])
 
+    def test_probe_dest_outside_stops_before_any_test(self):
+        """A probe whose dest leaves the target is rejected before any test runs."""
+        (self.tmp / "probe.py").write_text(PASSING)
+        probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base"],
+                   "dest": "../escape.py"}]
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("dest '../escape.py'", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+
     def test_bad_probe_target_stops_before_any_test(self):
         """A probe naming a PR not in the snapshot is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
@@ -595,6 +606,57 @@ class SmallBuilds(unittest.TestCase):
         self.assertEqual(res["merged"], [1])
         self.assertEqual([(p["target"], p["outcome"]) for p in res["probes"]], [("base", "pass"), (2, "error")])
         self.assertTrue(res["probes"][1]["message"])
+
+
+class NonMonotoneCulprit(unittest.TestCase):
+    """A failure that comes and goes as earlier PRs are added: bisection's candidate is checked."""
+    def setUp(self):
+        """Fresh temporary directory per test."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        """Remove the temporary directory."""
+        self._tmp.cleanup()
+
+    def test_passing_pair_is_never_reported_as_failing(self):
+        """PR 5 fails after PR 1 alone and after PRs 1-4, but passes after 1-2, 1-3 and with 4 alone."""
+        repo = self.tmp / "src"
+        repo.mkdir()
+        sh(repo, "git", "init", "-q", "-b", "main")
+        base = commit(repo, {"app.py": "X = 1\n", "tests/test_base.py": PASSING}, "base")
+        t = "import unittest\nclass T(unittest.TestCase):\n    def test_{0}(self): pass\n"
+        # PRs 1-4 each add a marker file; PR 5's test fails for markers {a} and {a, b, c, d} only.
+        heads = {k: branch(repo, f"p{k}", {f"{m}.txt": m, f"tests/test_p{k}.py": t.format(f"p{k}")})
+                 for k, m in zip(range(1, 5), "abcd")}
+        heads[5] = branch(repo, "p5", {"tests/test_p5.py":
+                                       "import os, unittest\nclass T(unittest.TestCase):\n"
+                                       "    def test_markers(self):\n"
+                                       "        have = {m for m in 'abcd' if os.path.exists(m + '.txt')}\n"
+                                       "        self.assertNotIn(have, [{'a'}, {'a', 'b', 'c', 'd'}])\n"})
+        sh(repo, "git", "update-ref", "refs/audit/base", base)
+        for n, head in heads.items():
+            sh(repo, "git", "update-ref", f"refs/audit/pr/{n}", head)
+        bundle = self.tmp / "snap.bundle"
+        sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        prs = [{"number": n, "title": f"p{n}", "head": h, "draft": False, "status": "SUCCESS",
+                "files": sorted(audit.names(sh(repo, "git", "diff", "--name-only", "-z", f"{base}...{h}") + "\0"))}
+               for n, h in heads.items()]
+        snap = self.tmp / "snap.json"
+        snap.write_text(json.dumps({"date": "test", "repo": "local/test", "base_ref": "main",
+                                    "base_sha": base, "prs": prs}))
+        config = self.tmp / "config.json"
+        config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", required_status="ci",
+                                          workers=1, order=[1, 2, 3, 4, 5])))
+        cfg = audit.load_config(str(config))
+        res = build(cfg, snap, bundle, self.tmp, "a")
+        # Bisection's candidate is PR 4, and PR 4 with PR 5 alone passes.
+        self.assertEqual(res["culprits"]["5"]["culprit"], 4)
+        self.assertEqual(res["culprits"]["5"]["pair"]["outcome"], "pass")
+        report = audit.render(cfg, res)
+        self.assertNotIn("a pair fails its tests", report)
+        self.assertNotIn("#4 + #5", report)
+        self.assertIn("bisection pointed at #4, but that pair passes alone:** #5", report)
 
 
 class Packaging(unittest.TestCase):
@@ -883,6 +945,21 @@ class Containment(unittest.TestCase):
         (self.root / "tests" / "p.py").symlink_to(target)
         self.assertIsNotNone(audit.place_probe(self.root, Path("tests/p.py"), b"x"))
         self.assertEqual(target.read_text(), "keep")
+
+    def test_probe_refuses_destination_outside(self):
+        """A probe destination that leaves the target is refused and nothing is written."""
+        for dest in ["../escape.py", "tests/../../escape.py", str(self.outside / "abs.py"),
+                     "/abs.py", "C:/abs.py", "C:abs.py", "\\\\host\\share\\abs.py", "..\\escape.py"]:
+            with self.subTest(dest=dest):
+                self.assertIsNotNone(audit.place_probe(self.root, Path(dest), b"x"))
+        self.assertEqual(list(self.outside.iterdir()), [])
+        self.assertEqual(list(self.tmp.glob("*.py")), [])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_probe_nested_destination_still_placed(self):
+        """A nested relative destination is created and written."""
+        self.assertIsNone(audit.place_probe(self.root, Path("tests/sub/p.py"), b"x"))
+        self.assertEqual((self.root / "tests" / "sub" / "p.py").read_bytes(), b"x")
 
     def test_work_directory_needs_marker(self):
         """A non-empty work directory without the marker is never cleared."""
