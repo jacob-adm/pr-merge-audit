@@ -1075,10 +1075,19 @@ def emit_branch(ws, gitdir, ref, tip):
     # The ref may have become a symbolic ref during the build; check again right before writing.
     if symref(gitdir, ref):
         raise RuntimeError(f"{ref} is now a symbolic ref to {symref(gitdir, ref)}")
-    # Create the branch; the empty old value makes git refuse if the ref exists by now. The reflog
-    # entry carries the operator's own identity and the real time, not the fixed merge identity;
-    # the commit itself, and so its id, are unchanged.
-    git(gitdir, "update-ref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
+    write_branch(gitdir, ref, tip)
+
+
+def write_branch(gitdir, ref, tip):
+    """Create `ref` at `tip`, writing that ref itself and never the branch a symbolic ref points to.
+
+    The empty old value makes git refuse if the ref exists, including a symbolic ref to an existing
+    branch. --no-deref stops git following a symbolic ref created after the last check; recent git
+    (2.56) also refuses a dangling one, while older git (2.50) replaces it with the branch itself.
+    The reflog entry carries the operator's own identity and the real time, not the fixed merge
+    identity; the commit itself, and so its id, are unchanged.
+    """
+    git(gitdir, "update-ref", "--no-deref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
 
 
 def cmd_build(cfg, args):
