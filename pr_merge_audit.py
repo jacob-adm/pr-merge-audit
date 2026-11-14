@@ -88,10 +88,28 @@ def load_config(path):
     # The test command is the only mandatory setting.
     if not cfg.get("test_cmd"):
         sys.exit(f"{path}: test_cmd is required")
+    if not argv_list(cfg["test_cmd"]):
+        sys.exit(f"{path}: test_cmd must be a non-empty list of string arguments")
     # Every probe must say how to run it.
     for probe in cfg.get("probes", []):
         if not probe.get("cmd"):
             sys.exit(f"{path}: probe {probe.get('name')!r} needs a cmd")
+        if not argv_list(probe["cmd"]):
+            sys.exit(f"{path}: probe {probe.get('name')!r}: cmd must be a non-empty list of string arguments")
+    # Numbers that size the run must be positive; bool is excluded, as JSON true is not a count.
+    for key, kinds in (("workers", (int,)), ("test_timeout", (int, float))):
+        value = cfg.get(key, 1)
+        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
+            sys.exit(f"{path}: {key} must be a positive number, not {value!r}")
+    # Output patterns are read through their first group, so each must compile and have one.
+    for key in ("failure_pattern", "count_pattern", "skipped_pattern", "message_pattern"):
+        if cfg.get(key):
+            try:
+                groups = re.compile(cfg[key]).groups
+            except (re.error, TypeError) as exc:
+                sys.exit(f"{path}: {key} is not a valid regular expression: {exc}")
+            if groups < 1:
+                sys.exit(f"{path}: {key} needs a capturing group, read as group 1")
     # Defaults: the current interpreter, a tests/ directory, a 30-minute run limit, 4 workers.
     cfg.setdefault("python", sys.executable)
     cfg.setdefault("test_prefix", "tests/")
@@ -119,6 +137,11 @@ def load_config(path):
     # Probe files are resolved relative to the configuration file.
     cfg["_dir"] = Path(path).resolve().parent
     return cfg
+
+
+def argv_list(value):
+    """Whether `value` is a non-empty JSON list of strings, the form of every command."""
+    return isinstance(value, list) and bool(value) and all(isinstance(a, str) for a in value)
 
 
 def fill(args, **values):
@@ -151,9 +174,12 @@ def windows_job(proc):
     job = k32.CreateJobObjectW(None, None)
     if job and k32.AssignProcessToJobObject(job, int(proc._handle)):
         return job
-    # Assignment failed: release the job and fall back to stopping the single process.
+    # Assignment failed: release the job and fall back to stopping the single process, and say so,
+    # since processes the tests start in the background may then outlive the run.
     if job:
         k32.CloseHandle(wintypes.HANDLE(job))
+    print(f"warning: could not put test process {proc.pid} in a job object (error {ctypes.get_last_error()}); "
+          "processes it starts may survive the run", file=sys.stderr)
     return None
 
 
@@ -633,6 +659,7 @@ class Workspace:
         root = scratch / "src"
         for d in (root, scratch / "home", scratch / "tmp"):
             d.mkdir()
+        proc = None
         try:
             # Stream `git archive` and extract member by member, refusing anything that could escape `root`.
             proc = subprocess.Popen(["git", "-c", "core.hooksPath=" + os.devnull, "archive", "--format=tar", commit],
@@ -650,6 +677,12 @@ class Workspace:
             prune_links(root)
         # Never leave a half-built export behind, even on interrupt.
         except BaseException:
+            # Stop and reap git archive too, so a failed extraction leaves no process behind.
+            if proc:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.stdout.close()
+                proc.wait()
             remove_tree(scratch)
             raise
         return scratch, root
@@ -1189,6 +1222,15 @@ def clean(text, table=False):
     return text.replace("|", "\\|") if table else text
 
 
+def prose(text):
+    """Configuration or snapshot text shown as plain Markdown: one line, punctuation escaped.
+
+    Keeps a name or reason from adding table cells, list items, links, mentions or HTML.
+    """
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text))
+    return re.sub(r"([\\`*_\[\]<>|#!~&@])", r"\\\1", text)
+
+
 def refs(ns):
     """PR numbers as a comma-separated list of `#N` references."""
     return ", ".join(f"#{n}" for n in ns)
@@ -1366,7 +1408,7 @@ def render(cfg, res):
         w("|---|---|---|---|")
         for p in res["probes"]:
             t = f"`{snap['base_ref']}`" if p["target"] == "base" else f"#{p['target']}"
-            w(f"| {p['probe']} | {t} | {p['outcome']} | {('`' + clean(p['message'], table=True) + '`') if p['message'] else ''} |")
+            w(f"| {prose(p['probe'])} | {t} | {p['outcome']} | {('`' + clean(p['message'], table=True) + '`') if p['message'] else ''} |")
         w("")
 
     # PRs not tried, grouped by reason, in a fixed order.
@@ -1389,9 +1431,9 @@ def render(cfg, res):
         if key in ("excluded", "duplicate"):
             w(f"- **{label}:**")
             for r in rows:
-                w(f"  - #{r['pr']}: {r['detail']}")
+                w(f"  - #{r['pr']}: {prose(r['detail'])}")
         elif key == "status":
-            w(f"- **{label}:** " + ", ".join(f"#{r['pr']} ({r['detail']})" for r in rows))
+            w(f"- **{label}:** " + ", ".join(f"#{r['pr']} ({prose(r['detail'])})" for r in rows))
         else:
             w(f"- **{label}:** {refs(r['pr'] for r in rows)}")
     if res["not_tried"]:
