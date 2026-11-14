@@ -801,7 +801,12 @@ def build_from(ws, name, prs):
 
 
 def find_culprit(ws, n, seq, name):
-    """First PR in `seq` whose addition makes PR `n` fail its tests, by bisection."""
+    """A candidate for the PR in `seq` whose addition makes PR `n` fail its tests, found by bisection.
+
+    Bisection assumes that once PR `n` fails with a prefix of `seq`, it fails with every longer one.
+    A later PR can repair an earlier interaction, so the candidate is confirmed by testing it with
+    PR `n` alone; `pair` holds that result, and only a failing pair names a culprit in the report.
+    """
     ws.phase("culprit")
     def fails_with(k):
         """Whether PR `n` fails (or conflicts) when merged after the first `k` PRs of `seq`."""
@@ -1180,6 +1185,11 @@ def cmd_build(cfg, args):
 # ---------------------------------------------------------------- report
 
 
+def confirmed(c):
+    """Whether a culprit search's candidate also fails (or conflicts) when merged with the PR alone."""
+    return bool(c.get("culprit")) and c["pair"]["outcome"] not in ("pass", "flaky")
+
+
 def clean(text, table=False):
     """Text from test output, made safe inside a Markdown code span (and a table cell)."""
     # Collapse control characters, neutralise backticks and cap the length.
@@ -1242,7 +1252,7 @@ def render(cfg, res):
     w("- **Swap test:** for each conflicting PR, the merged PR(s) it conflicts with on its own "
       "(`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.")
     w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
-      "its swap, the merge sequence is bisected to the first merged PR that makes it fail; that pair "
+      "its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair "
       "is then merged onto the base alone and tested.")
     # The selection rules in force.
     if rules:
@@ -1313,15 +1323,17 @@ def render(cfg, res):
             w(f"  It also fails on `{snap['base_ref']}` alone.")
         elif c.get("on_base") == "conflict":
             w(f"  It does not merge onto `{snap['base_ref']}` alone.")
-        if c.get("culprit"):
+        if confirmed(c):
             pairs.append((c["culprit"], n, c["pair"]))
+        elif c.get("culprit"):
+            w(f"  Bisection pointed at #{c['culprit']}, but that pair passes alone.")
     if bad_swaps:
         w("")
 
     # Collect culprit pairs from the failures of the sequential build.
     for n in res["order"]:
         c = culprits.get(n)
-        if c and c.get("culprit"):
+        if c and confirmed(c):
             pairs.append((c["culprit"], n, c["pair"]))
     # Section: pairs that merge cleanly but fail their tests together.
     if pairs:
@@ -1347,6 +1359,8 @@ def render(cfg, res):
             other.append(f"- **Fails its own tests on `{snap['base_ref']}`:** #{n} ({code(st.get('failures', []))}).")
         elif c.get("on_base") == "conflict":
             other.append(f"- **Fails in the build and does not merge onto `{snap['base_ref']}` alone:** #{n} ({code(st.get('failures', []))}).")
+        elif c.get("culprit") and not confirmed(c):
+            other.append(f"- **Fails only in the full build; bisection pointed at #{c['culprit']}, but that pair passes alone:** #{n} ({code(st.get('failures', []))}).")
         elif c and not c.get("culprit"):
             other.append(f"- **Fails only in the full build, no single culprit found:** #{n} ({code(st.get('failures', []))}).")
         if st.get("outcome") == "flaky":
