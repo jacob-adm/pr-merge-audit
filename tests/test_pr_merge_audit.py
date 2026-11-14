@@ -400,6 +400,49 @@ class EmitBranch(unittest.TestCase):
         self.assertEqual(sh(user, "git", "rev-parse", "refs/heads/late"), base)
 
 
+class EmitRace(unittest.TestCase):
+    """A symbolic ref that appears at the branch name after the last check is never written through."""
+    def setUp(self):
+        """A repository with one commit and a second branch `other`."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name) / "r"
+        self.repo.mkdir()
+        sh(self.repo, "git", "init", "-q", "-b", "main")
+        self.tip = commit(self.repo, {"a.txt": "a"}, "a")
+        sh(self.repo, "git", "branch", "other")
+        self.gitdir = sh(self.repo, "git", "rev-parse", "--absolute-git-dir")
+
+    def tearDown(self):
+        """Remove the repository."""
+        self._tmp.cleanup()
+
+    def refs(self):
+        """Every ref, as `name value`, with symbolic refs shown as their target."""
+        return sh(self.repo, "git", "for-each-ref", "--format=%(refname) %(objectname) %(symref)").splitlines()
+
+    def test_dangling_symref_is_not_followed(self):
+        """The named branch is written itself; the ref it pointed to is never created."""
+        sh(self.repo, "git", "symbolic-ref", "refs/heads/integration", "refs/heads/unexpected")
+        audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
+        self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "refs/heads/integration"],
+                                           cwd=self.repo).returncode, 0)
+        self.assertNotIn("refs/heads/unexpected", "\n".join(self.refs()))
+
+    def test_symref_to_existing_branch_fails_unchanged(self):
+        """A symbolic ref to an existing branch makes the write fail and leaves every ref as it was."""
+        sh(self.repo, "git", "symbolic-ref", "refs/heads/integration", "refs/heads/other")
+        before = self.refs()
+        with self.assertRaises(RuntimeError):
+            audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        self.assertEqual(self.refs(), before)
+
+    def test_plain_name_is_created(self):
+        """Without interference the branch is created at the tip."""
+        audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
+
+
 def small_project(tmp, base_test, status, base_files=None, pr_test=None, pr_files=None, **cfg):
     """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
     repo = tmp / "src"
