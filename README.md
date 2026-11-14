@@ -72,8 +72,11 @@ build can be re-run later even after PR branches move or are deleted.
 3. **Swap test.** For each conflicting PR, the merged PRs it conflicts with pairwise
    (`git merge-tree`) are reverted, the PR is merged in their place, and the tests run.
 4. **Culprit search.** For each PR that fails tests without a text conflict, or still fails after
-   its swap, the merge sequence is bisected to the first PR that makes it fail, and that pair is
-   tested alone on the base.
+   its swap, the merge sequence is bisected for a PR that makes it fail, and that pair is tested
+   alone on the base. Bisection assumes a failure, once it appears, stays as more PRs are merged;
+   a later PR that repairs an earlier interaction can mislead it. The report names a pair as
+   failing only when the pair fails alone; otherwise it lists the PR under Other with the
+   candidate bisection pointed at.
 5. **Probes.** Each file in `probes` is copied into each listed target (the base, or a PR head)
    and run with the probe's own command.
 
