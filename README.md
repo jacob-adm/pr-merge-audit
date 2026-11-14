@@ -35,7 +35,7 @@ PR number twice, or whose ids differ from the bundle's refs, before any test run
 ## Install
 
 ```
-pip install git+https://github.com/jacob-adm/pr-merge-audit
+pip install pr-merge-audit
 pr-merge-audit --help
 ```
 
