@@ -497,6 +497,33 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("no targets", str(stop.exception.code))
         self.assertFalse((self.tmp / "work-a").exists())
 
+    def test_snapshot_must_match_bundle(self):
+        """A snapshot naming other commits than its bundle, or malformed, is refused before any test runs."""
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        good = json.loads(snap.read_text())
+        base, head = good["base_sha"], good["prs"][0]["head"]
+        pr = good["prs"][0]
+        cases = {
+            "PR #1 is " + base: dict(good, prs=[dict(pr, head=base)]),           # heads swapped
+            "base is " + head: dict(good, base_sha=head),                        # wrong base
+            "missing in the bundle (refs/audit/pr/2)": dict(good, prs=[pr, dict(pr, number=2)]),
+            "PR #1 is listed twice": dict(good, prs=[pr, pr]),
+            "is not a full commit id like base_sha": dict(good, prs=[dict(pr, head=head[:12])]),
+            "base_sha 'main' is not a full commit id": dict(good, base_sha="main"),
+            "PR number '1' is not a positive integer": dict(good, prs=[dict(pr, number="1")]),
+        }
+        for i, (message, data) in enumerate(cases.items()):
+            with self.subTest(message=message):
+                snap.write_text(json.dumps(data))
+                with self.assertRaises(SystemExit) as stop:
+                    build(cfg, snap, bundle, self.tmp, f"m{i}")
+                self.assertIn(message, str(stop.exception.code))
+                self.assertFalse((self.tmp / f"m{i}.json").exists())
+                self.assertFalse((self.tmp / f"work-m{i}" / "repo").exists())
+        # The consistent snapshot still builds.
+        snap.write_text(json.dumps(good))
+        self.assertEqual(build(cfg, snap, bundle, self.tmp, "ok")["merged"], [1])
+
     def test_bad_probe_target_stops_before_any_test(self):
         """A probe naming a PR not in the snapshot is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
@@ -555,9 +582,14 @@ class SmallBuilds(unittest.TestCase):
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 2]}]
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        # PR 2's ref names a blob, not a commit: snapshot and bundle agree, but its export fails.
+        repo = self.tmp / "src"
+        blob = sh(repo, "git", "hash-object", "-w", "app.py")
+        sh(repo, "git", "update-ref", "refs/audit/pr/2", blob)
+        sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
         data = json.loads(snap.read_text())
-        data["prs"].append({"number": 2, "title": "gone", "head": "f" * 40, "draft": True, "status": "SUCCESS",
-                            "files": []})  # head not in the bundle, so its export fails
+        data["prs"].append({"number": 2, "title": "blob", "head": blob, "draft": True, "status": "SUCCESS",
+                            "files": []})
         snap.write_text(json.dumps(data))
         res = build(cfg, snap, bundle, self.tmp, "a")
         self.assertEqual(res["merged"], [1])
