@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 __version__ = "1.1.0"
 
@@ -231,6 +231,20 @@ def check_git():
                  f"found: {found or 'no git on PATH'}")
 
 
+def probe_dest(cfg, probe):
+    """Where a probe file goes in the target: its `dest`, or `test_prefix` + `audit_probe_` + its name."""
+    return Path(probe.get("dest") or Path(cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
+
+
+def relative_inside(rel):
+    """Whether `rel` names a file below a directory on every platform: not absolute, no drive, no '..'."""
+    # Judge the path both ways, so a config written on one platform is safe on the other.
+    for pure in (PurePosixPath(str(rel)), PureWindowsPath(str(rel))):
+        if pure.is_absolute() or pure.drive or pure.root or ".." in pure.parts or not pure.parts:
+            return False
+    return True
+
+
 def check_probes(cfg, snap):
     """Stop before any test runs if a probe names a missing file or a target not in the snapshot."""
     # PR numbers in the snapshot, the only valid PR targets.
@@ -241,6 +255,10 @@ def check_probes(cfg, snap):
             sys.exit(f"probe {probe['name']!r}: file {probe['file']} not found next to the config")
         if not probe.get("targets"):
             sys.exit(f"probe {probe['name']!r}: no targets; list \"base\" and/or PR numbers")
+        # The destination must stay inside the tested copy.
+        rel = probe_dest(cfg, probe)
+        if not relative_inside(rel):
+            sys.exit(f"probe {probe['name']!r}: dest {rel.as_posix()!r} must be a relative path inside the target, without '..'")
         # Each target must be the base or a PR in this snapshot.
         for target in probe["targets"]:
             if target != "base" and target not in numbers:
@@ -856,6 +874,9 @@ def swap(ws, n, merged, tip):
 
 def place_probe(root, rel, data):
     """Write the probe file under `root`, refusing symlinks anywhere on the way and existing files."""
+    # Refuse a destination outside `root` before creating anything.
+    if not relative_inside(rel):
+        return f"{rel}: not a relative path inside the target"
     # Create parent directories one by one, refusing any that is a symlink.
     path = root
     for part in Path(rel).parts[:-1]:
@@ -864,6 +885,10 @@ def place_probe(root, rel, data):
             return f"{rel}: a directory on the path is a symlink"
         path.mkdir(exist_ok=True)
     # Exclusive create and no-follow: never overwrite a file or write through a link the PR placed.
+    # The parent, with every link resolved, must still be inside `root`.
+    top = str(root.resolve())
+    if os.path.commonpath([str((root / rel).parent.resolve()), top]) != top:
+        return f"{rel}: resolves outside the target"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(root / rel, flags, 0o644)
@@ -882,7 +907,7 @@ def run_probe(ws, probe, target):
     """
     ws.phase("probe")
     # Where the probe goes in the target, and its dotted module name for test runners that need one.
-    rel = Path(probe.get("dest") or Path(ws.cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
+    rel = probe_dest(ws.cfg, probe)
     module = str(rel.with_suffix("")).replace(os.sep, ".")
     # Resolve the probe command's placeholders.
     argv = fill(probe["cmd"], python=ws.cfg["python"], dest=rel, module=module)

@@ -497,6 +497,17 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("no targets", str(stop.exception.code))
         self.assertFalse((self.tmp / "work-a").exists())
 
+    def test_probe_dest_outside_stops_before_any_test(self):
+        """A probe whose dest leaves the target is rejected before any test runs."""
+        (self.tmp / "probe.py").write_text(PASSING)
+        probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base"],
+                   "dest": "../escape.py"}]
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a")
+        self.assertIn("dest '../escape.py'", str(stop.exception.code))
+        self.assertFalse((self.tmp / "work-a").exists())
+
     def test_bad_probe_target_stops_before_any_test(self):
         """A probe naming a PR not in the snapshot is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
@@ -851,6 +862,21 @@ class Containment(unittest.TestCase):
         (self.root / "tests" / "p.py").symlink_to(target)
         self.assertIsNotNone(audit.place_probe(self.root, Path("tests/p.py"), b"x"))
         self.assertEqual(target.read_text(), "keep")
+
+    def test_probe_refuses_destination_outside(self):
+        """A probe destination that leaves the target is refused and nothing is written."""
+        for dest in ["../escape.py", "tests/../../escape.py", str(self.outside / "abs.py"),
+                     "/abs.py", "C:/abs.py", "C:abs.py", "\\\\host\\share\\abs.py", "..\\escape.py"]:
+            with self.subTest(dest=dest):
+                self.assertIsNotNone(audit.place_probe(self.root, Path(dest), b"x"))
+        self.assertEqual(list(self.outside.iterdir()), [])
+        self.assertEqual(list(self.tmp.glob("*.py")), [])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_probe_nested_destination_still_placed(self):
+        """A nested relative destination is created and written."""
+        self.assertIsNone(audit.place_probe(self.root, Path("tests/sub/p.py"), b"x"))
+        self.assertEqual((self.root / "tests" / "sub" / "p.py").read_bytes(), b"x")
 
     def test_work_directory_needs_marker(self):
         """A non-empty work directory without the marker is never cleared."""
