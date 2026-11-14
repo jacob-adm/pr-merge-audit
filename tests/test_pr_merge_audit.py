@@ -451,6 +451,7 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("### Result: no PRs were eligible to try", text)
         self.assertIn("#1 (failure)", text)
         self.assertNotIn("(0)", text)
+        self.assertNotIn("Serial landing", text)
         self.assertNotIn("\n\n\n", text)
 
     def test_ignore_status_is_applied_and_shown(self):
@@ -519,6 +520,27 @@ class SmallBuilds(unittest.TestCase):
         text = audit.render(cfg, res)
         self.assertIn("**Flaky (failed, then passed on re-run):** #1.", text)
         self.assertNotIn("no single culprit", text)
+
+    def test_estimate_prints_serial_landing_for_the_snapshot_at_the_time_measured_here(self):
+        """`estimate` uses N from the snapshot and the suite time it measured, not the reference build's."""
+        import contextlib
+        import io
+        import re
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        ref = build(cfg, snap, bundle, self.tmp, "ref")
+        # A reference with other N and times: none of it may reach the serial-landing lines.
+        ref["order"], ref["timing"] = [1, 2, 3, 4, 5], {"run_seconds": {"sequence": {"median": 999.0}}}
+        (self.tmp / "ref.json").write_text(json.dumps(ref))
+        args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), reference=str(self.tmp / "ref.json"),
+                                  work=str(self.tmp / "work-estimate"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            audit.cmd_estimate(cfg, args)
+        text = out.getvalue()
+        one = float(re.search(r"N\(N\+1\)/2 = 1 full runs x ([0-9.]+) s", text).group(1))
+        self.assertIn("\n".join(audit.serial_landing(1, one)) + "\n", text)
+        self.assertIn("assuming one suite run at a time", text)
+        self.assertNotIn("999", text)
 
     def test_environment_line_names_python_only_when_used(self):
         """The report names a Python version only if a command uses Python."""
@@ -696,6 +718,34 @@ class Helpers(unittest.TestCase):
         text = audit.render({}, res)
         self.assertIn(f"**#{a}:** the swap test could not run (`RuntimeError: boom`).", text)
         self.assertIn(f"**Culprit search could not run:** #{b} (`RuntimeError: bang`).", text)
+
+    def test_serial_landing_in_the_report_is_counts_only(self):
+        """The report gives N, N(N+1)/2 runs and this build's runs, and no times, so it stays deterministic."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        text = audit.render({}, res)
+        self.assertIn("landing the N = 6 PRs tried here one at a time, re-testing every PR still open after each "
+                      "landing, would take N(N+1)/2 = 21 full test-suite runs, against the 19 this build counted "
+                      "(1.1 times as many).", text)
+        # Measured times, however different, never reach the report.
+        res["timing"] = {"run_seconds": {"sequence": {"count": 8, "median": 123.45}}, "wall_seconds": {"total": 9876.5}}
+        self.assertEqual(audit.render({}, res), text)
+
+    def test_serial_landing_ratio_only_when_serial_costs_more(self):
+        """With as many or more runs counted than serial landing needs, the report gives no ratio."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        for sequence, counted in ((10, 21), (30, 41)):  # 21 is exactly the serial count
+            res["test_runs"]["sequence"] = sequence
+            text = audit.render({}, res)
+            self.assertIn(f"N(N+1)/2 = 21 full test-suite runs, against the {counted} this build counted. ", text)
+            self.assertNotIn("times as many", text)
+
+    def test_serial_landing_hours(self):
+        """N(N+1)/2 runs in machine-hours and N runs as hours to land, at the given suite time."""
+        self.assertEqual(audit.serial_landing(6, 120.0), [
+            "serial landing of the N = 6 PRs this snapshot would try, one at a time (estimate):",
+            "  N(N+1)/2 = 21 full runs x 120.0 s  ~0.7 machine-hours",
+            "  N x 120.0 s                 ~0.2 hours to land them, assuming one suite run at a time "
+            "(each landing waits for its run)"])
 
     def test_empty_blockers_render_in_words(self):
         """A swap with no blockers is described in words, not as an empty list."""

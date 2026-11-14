@@ -1382,6 +1382,19 @@ def render(cfg, res):
           f"parallel workers. Running time scales with the time one test-suite run takes on the "
           f"machine used.")
         w("")
+    # Serial-landing comparison, in counts only, so the report stays deterministic. N is the number
+    # of PRs tried: landing them one at a time, every PR still open is re-tested after each landing,
+    # so the runs are N + (N - 1) + ... + 1 = N(N+1)/2. `estimate` turns this into hours.
+    if tried:
+        serial = tried * (tried + 1) // 2
+        # Compare with this build's counted runs; a ratio only when serial landing costs more.
+        vs = f", against the {total} this build counted" if runs else ""
+        if runs and serial > total:
+            vs += f" ({serial / total:.1f} times as many)"
+        w(f"**Serial landing (estimate):** landing the N = {tried} PRs tried here one at a time, re-testing "
+          f"every PR still open after each landing, would take N(N+1)/2 = {serial} full test-suite runs{vs}. "
+          f"The `estimate` command converts these counts to hours using a build's measured run times.")
+        w("")
     # Closing caveat on what the results prove.
     w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
     return "\n".join(L) + "\n"
@@ -1435,7 +1448,8 @@ def cmd_estimate(cfg, args):
     ws.drop(wt)
     remove_tree(ws.work)
     # Scale the reference build's run counts by the number of PRs this snapshot would try.
-    scale = len(classify(cfg, snap)[0]) / max(1, len(ref["order"]))
+    tried = len(classify(cfg, snap)[0])
+    scale = tried / max(1, len(ref["order"]))
     # Sequential runs happen one at a time; follow-up runs share the workers.
     seq = runs["sequence"] * scale * one
     rest = (runs["swap"] + runs["culprit"] + runs["probe"]) * scale * one / max(1, cfg["workers"])
@@ -1444,6 +1458,22 @@ def cmd_estimate(cfg, args):
     print(f"  sequential build  ~{seq / 60:.0f} min")
     print(f"  follow-up jobs    ~{rest / 60:.0f} min on {cfg['workers']} workers")
     print(f"  total             ~{(seq + rest) / 60:.0f} min (merges and bisection rebuilds add some more)")
+    # Landing this snapshot's PRs one at a time instead, at the suite time just measured here.
+    for line in serial_landing(tried, one):
+        print(line)
+
+
+def serial_landing(n, one):
+    """Lines estimating the cost of landing `n` PRs one at a time, at `one` seconds per suite run.
+
+    Machine-dependent, so it is printed by `estimate` and never put in the report.
+    """
+    # Every PR still open is re-tested after each landing: n + (n - 1) + ... + 1 runs.
+    serial = n * (n + 1) // 2
+    return [f"serial landing of the N = {n} PRs this snapshot would try, one at a time (estimate):",
+            f"  N(N+1)/2 = {serial} full runs x {one:.1f} s  ~{serial * one / 3600:.1f} machine-hours",
+            f"  N x {one:.1f} s                 ~{n * one / 3600:.1f} hours to land them, assuming one suite run "
+            f"at a time (each landing waits for its run)"]
 
 
 def main():
