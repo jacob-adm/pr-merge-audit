@@ -254,7 +254,9 @@ sequence. Treat the follow-up figure as a minimum.
 A probe's `file` (relative to the configuration file) is written to `dest` in the target, by
 default `test_prefix` + `audit_probe_` + its file name, and `cmd` is run there. In `cmd`,
 `{python}`, `{dest}` and `{module}` (`dest` without its suffix, with `.` for `/`) are replaced.
-Targets are `"base"` or PR numbers. Probe output is read with the same patterns as the tests.
+Targets are `"base"` or PR numbers. Probe output is read with the same patterns as the tests. `dest`
+must be a relative path inside the target: an absolute path, a drive or a `..` part stops the
+build before any test runs.
 
 ## Tests
 
