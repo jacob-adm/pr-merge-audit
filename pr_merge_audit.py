@@ -231,6 +231,24 @@ def check_git():
                  f"found: {found or 'no git on PATH'}")
 
 
+def check_snapshot(snap):
+    """Stop before any work if the snapshot has malformed commit ids or a PR number twice."""
+    base = str(snap.get("base_sha", ""))
+    # One id length for every commit: 40 hex digits (SHA-1) or 64 (SHA-256), lowercase as git prints.
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
+        sys.exit(f"snapshot: base_sha {base!r} is not a full commit id")
+    seen = set()
+    for p in snap["prs"]:
+        n = p.get("number")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            sys.exit(f"snapshot: PR number {n!r} is not a positive integer")
+        if n in seen:
+            sys.exit(f"snapshot: PR #{n} is listed twice")
+        seen.add(n)
+        if not re.fullmatch(r"[0-9a-f]{%d}" % len(base), str(p.get("head", ""))):
+            sys.exit(f"snapshot: PR #{n} head {p.get('head')!r} is not a full commit id like base_sha")
+
+
 def probe_dest(cfg, probe):
     """Where a probe file goes in the target: its `dest`, or `test_prefix` + `audit_probe_` + its name."""
     return Path(probe.get("dest") or Path(cfg["test_prefix"]) / ("audit_probe_" + Path(probe["file"]).name))
@@ -528,6 +546,8 @@ class Workspace:
     def __init__(self, cfg, snap, bundle, work):
         """Create a fresh workspace under `work` and load the snapshot bundle into it."""
         # Paths, synchronisation primitives and per-phase counters.
+        # A malformed snapshot is refused before anything is created.
+        check_snapshot(snap)
         self.cfg, self.snap = cfg, snap
         self.work = Path(work).resolve()
         self.repo = self.work / "repo"
@@ -554,6 +574,23 @@ class Workspace:
         # Commit ids for the base and each PR head.
         self.base = snap["base_sha"]
         self.heads = {p["number"]: p["head"] for p in snap["prs"]}
+        # Every commit the snapshot names must be the one the bundle holds under that name.
+        mismatch = self.bundle_mismatch()
+        if mismatch:
+            remove_tree(self.work)
+            sys.exit(f"snapshot and bundle disagree: {mismatch}")
+
+    def bundle_mismatch(self):
+        """The first base or PR whose commit in the snapshot differs from the bundle's ref, else None."""
+        # Every ref the bundle brought in, by name.
+        out = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/audit").stdout
+        have = dict(line.split(" ", 1) for line in out.splitlines())
+        want = [("base", "refs/audit/base", self.base)]
+        want += [(f"PR #{n}", f"refs/audit/pr/{n}", head) for n, head in self.heads.items()]
+        for what, ref, sha in want:
+            if have.get(ref) != sha:
+                return f"{what} is {sha} in the snapshot but {have.get(ref) or 'missing'} in the bundle ({ref})"
+        return None
 
     def ref(self, n):
         """Commit for a target: the base, or the head of PR `n`."""

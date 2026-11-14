@@ -29,6 +29,9 @@ the two snapshot files yourself and run `build` on them:
 - `snapshots/DATE.bundle`: a `git bundle` holding `refs/audit/base` and `refs/audit/pr/N` for
   each PR.
 
+`build` refuses a snapshot whose `base_sha` or a PR's `head` is not a full commit id, that lists a
+PR number twice, or whose ids differ from the bundle's refs, before any test runs.
+
 ## Install
 
 ```
