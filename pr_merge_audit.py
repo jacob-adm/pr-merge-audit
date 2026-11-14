@@ -258,7 +258,7 @@ def check_probes(cfg, snap):
         # The destination must stay inside the tested copy.
         rel = probe_dest(cfg, probe)
         if not relative_inside(rel):
-            sys.exit(f"probe {probe['name']!r}: dest {str(rel)!r} must be a relative path inside the target, without '..'")
+            sys.exit(f"probe {probe['name']!r}: dest {rel.as_posix()!r} must be a relative path inside the target, without '..'")
         # Each target must be the base or a PR in this snapshot.
         for target in probe["targets"]:
             if target != "base" and target not in numbers:
