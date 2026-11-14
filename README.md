@@ -109,9 +109,9 @@ configured order. Land it as one pull request instead of landing the PRs one by 
 - **Never overwrites.** The write itself requires that `REF` still does not exist and is not a
   symbolic ref. If either has changed during the build, the results are written without the
   branch and the build exits with an error. The write never follows a symbolic ref, so no other
-  branch is created: a symbolic ref to an existing branch makes it fail, and one that points
-  nowhere, created in the moment between the last check and the write, is replaced by `REF`
-  itself (git cannot refuse it atomically).
+  branch is created: a symbolic ref to an existing branch makes it fail, and so does one that
+  points nowhere, created in the moment between the last check and the write, with recent git
+  (2.56 refuses it; 2.50 replaces it with `REF` itself).
 - **Manifest.** The results file gains an `emitted` key: the repository's git directory, the
   ref, the commit, the PRs included (in merge order) and every PR excluded with its reason
   (`conflict`, `fail` or `flaky` for PRs that were tried, `not tried: ...` for the rest). The

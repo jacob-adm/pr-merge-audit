@@ -1082,8 +1082,8 @@ def write_branch(gitdir, ref, tip):
     """Create `ref` at `tip`, writing that ref itself and never the branch a symbolic ref points to.
 
     The empty old value makes git refuse if the ref exists, including a symbolic ref to an existing
-    branch. --no-deref stops git following a symbolic ref created after the last check; git has no
-    way to refuse a dangling one atomically, so such a ref is replaced by the branch itself.
+    branch. --no-deref stops git following a symbolic ref created after the last check; recent git
+    (2.56) also refuses a dangling one, while older git (2.50) replaces it with the branch itself.
     The reflog entry carries the operator's own identity and the real time, not the fixed merge
     identity; the commit itself, and so its id, are unchanged.
     """

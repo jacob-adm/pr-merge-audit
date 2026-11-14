@@ -421,13 +421,21 @@ class EmitRace(unittest.TestCase):
         return sh(self.repo, "git", "for-each-ref", "--format=%(refname) %(objectname) %(symref)").splitlines()
 
     def test_dangling_symref_is_not_followed(self):
-        """The named branch is written itself; the ref it pointed to is never created."""
+        """The ref a dangling symref points to is never created.
+
+        Newer git refuses the write and leaves the symref; older git replaces it with the branch.
+        """
         sh(self.repo, "git", "symbolic-ref", "refs/heads/integration", "refs/heads/unexpected")
-        audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
-        self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
-        self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "refs/heads/integration"],
-                                           cwd=self.repo).returncode, 0)
-        self.assertNotIn("refs/heads/unexpected", "\n".join(self.refs()))
+        try:
+            audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        except RuntimeError as exc:
+            self.assertIn("dangling symref", str(exc))
+            self.assertEqual(sh(self.repo, "git", "symbolic-ref", "refs/heads/integration"), "refs/heads/unexpected")
+        else:
+            self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
+            self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "refs/heads/integration"],
+                                               cwd=self.repo).returncode, 0)
+        self.assertFalse(any(r.startswith("refs/heads/unexpected ") for r in self.refs()))
 
     def test_symref_to_existing_branch_fails_unchanged(self):
         """A symbolic ref to an existing branch makes the write fail and leaves every ref as it was."""
