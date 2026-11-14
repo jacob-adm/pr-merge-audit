@@ -400,6 +400,57 @@ class EmitBranch(unittest.TestCase):
         self.assertEqual(sh(user, "git", "rev-parse", "refs/heads/late"), base)
 
 
+class EmitRace(unittest.TestCase):
+    """A symbolic ref that appears at the branch name after the last check is never written through."""
+    def setUp(self):
+        """A repository with one commit and a second branch `other`."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name) / "r"
+        self.repo.mkdir()
+        sh(self.repo, "git", "init", "-q", "-b", "main")
+        self.tip = commit(self.repo, {"a.txt": "a"}, "a")
+        sh(self.repo, "git", "branch", "other")
+        self.gitdir = sh(self.repo, "git", "rev-parse", "--absolute-git-dir")
+
+    def tearDown(self):
+        """Remove the repository."""
+        self._tmp.cleanup()
+
+    def refs(self):
+        """Every ref, as `name value`, with symbolic refs shown as their target."""
+        return sh(self.repo, "git", "for-each-ref", "--format=%(refname) %(objectname) %(symref)").splitlines()
+
+    def test_dangling_symref_is_not_followed(self):
+        """The ref a dangling symref points to is never created.
+
+        Newer git refuses the write and leaves the symref; older git replaces it with the branch.
+        """
+        sh(self.repo, "git", "symbolic-ref", "refs/heads/integration", "refs/heads/unexpected")
+        try:
+            audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        except RuntimeError as exc:
+            self.assertIn("dangling symref", str(exc))
+            self.assertEqual(sh(self.repo, "git", "symbolic-ref", "refs/heads/integration"), "refs/heads/unexpected")
+        else:
+            self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
+            self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "refs/heads/integration"],
+                                               cwd=self.repo).returncode, 0)
+        self.assertFalse(any(r.startswith("refs/heads/unexpected ") for r in self.refs()))
+
+    def test_symref_to_existing_branch_fails_unchanged(self):
+        """A symbolic ref to an existing branch makes the write fail and leaves every ref as it was."""
+        sh(self.repo, "git", "symbolic-ref", "refs/heads/integration", "refs/heads/other")
+        before = self.refs()
+        with self.assertRaises(RuntimeError):
+            audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        self.assertEqual(self.refs(), before)
+
+    def test_plain_name_is_created(self):
+        """Without interference the branch is created at the tip."""
+        audit.write_branch(self.gitdir, "refs/heads/integration", self.tip)
+        self.assertEqual(sh(self.repo, "git", "rev-parse", "refs/heads/integration"), self.tip)
+
+
 def small_project(tmp, base_test, status, base_files=None, pr_test=None, pr_files=None, **cfg):
     """One PR on top of a base whose test is `base_test`; the PR's status check is `status`."""
     repo = tmp / "src"
@@ -497,6 +548,33 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("no targets", str(stop.exception.code))
         self.assertFalse((self.tmp / "work-a").exists())
 
+    def test_snapshot_must_match_bundle(self):
+        """A snapshot naming other commits than its bundle, or malformed, is refused before any test runs."""
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        good = json.loads(snap.read_text())
+        base, head = good["base_sha"], good["prs"][0]["head"]
+        pr = good["prs"][0]
+        cases = {
+            "PR #1 is " + base: dict(good, prs=[dict(pr, head=base)]),           # heads swapped
+            "base is " + head: dict(good, base_sha=head),                        # wrong base
+            "missing in the bundle (refs/audit/pr/2)": dict(good, prs=[pr, dict(pr, number=2)]),
+            "PR #1 is listed twice": dict(good, prs=[pr, pr]),
+            "is not a full commit id like base_sha": dict(good, prs=[dict(pr, head=head[:12])]),
+            "base_sha 'main' is not a full commit id": dict(good, base_sha="main"),
+            "PR number '1' is not a positive integer": dict(good, prs=[dict(pr, number="1")]),
+        }
+        for i, (message, data) in enumerate(cases.items()):
+            with self.subTest(message=message):
+                snap.write_text(json.dumps(data))
+                with self.assertRaises(SystemExit) as stop:
+                    build(cfg, snap, bundle, self.tmp, f"m{i}")
+                self.assertIn(message, str(stop.exception.code))
+                self.assertFalse((self.tmp / f"m{i}.json").exists())
+                self.assertFalse((self.tmp / f"work-m{i}" / "repo").exists())
+        # The consistent snapshot still builds.
+        snap.write_text(json.dumps(good))
+        self.assertEqual(build(cfg, snap, bundle, self.tmp, "ok")["merged"], [1])
+
     def test_probe_dest_outside_stops_before_any_test(self):
         """A probe whose dest leaves the target is rejected before any test runs."""
         (self.tmp / "probe.py").write_text(PASSING)
@@ -566,9 +644,14 @@ class SmallBuilds(unittest.TestCase):
         (self.tmp / "probe.py").write_text(PASSING)
         probes = [{"name": "p", "file": "probe.py", "cmd": PROBE_CMD, "targets": ["base", 2]}]
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", probes=probes)
+        # PR 2's ref names a blob, not a commit: snapshot and bundle agree, but its export fails.
+        repo = self.tmp / "src"
+        blob = sh(repo, "git", "hash-object", "-w", "app.py")
+        sh(repo, "git", "update-ref", "refs/audit/pr/2", blob)
+        sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
         data = json.loads(snap.read_text())
-        data["prs"].append({"number": 2, "title": "gone", "head": "f" * 40, "draft": True, "status": "SUCCESS",
-                            "files": []})  # head not in the bundle, so its export fails
+        data["prs"].append({"number": 2, "title": "blob", "head": blob, "draft": True, "status": "SUCCESS",
+                            "files": []})
         snap.write_text(json.dumps(data))
         res = build(cfg, snap, bundle, self.tmp, "a")
         self.assertEqual(res["merged"], [1])
@@ -625,6 +708,74 @@ class NonMonotoneCulprit(unittest.TestCase):
         self.assertNotIn("a pair fails its tests", report)
         self.assertNotIn("#4 + #5", report)
         self.assertIn("bisection pointed at #4, but that pair passes alone:** #5", report)
+
+
+class Hardening(unittest.TestCase):
+    """Config mistakes stop at load; report text from config is escaped; failed exports leave no process."""
+    def setUp(self):
+        """Fresh temporary directory per test."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        """Remove the temporary directory."""
+        self._tmp.cleanup()
+
+    def test_bad_config_values_stop_at_load(self):
+        """Each malformed value is refused when the config is loaded, naming the key."""
+        good = dict(UNITTEST, repo="local/test", base="main")
+        cases = {
+            "test_cmd must be": dict(good, test_cmd="python -m unittest"),
+            "test_cmd must be ": dict(good, test_cmd=["python", 3]),
+            "cmd must be": dict(good, probes=[{"name": "p", "file": "p.py", "cmd": [None], "targets": ["base"]}]),
+            "workers must be": dict(good, workers=0),
+            "workers must be ": dict(good, workers=True),
+            "test_timeout must be": dict(good, test_timeout=-1),
+            "count_pattern needs a capturing group": dict(good, count_pattern=r"^Ran \d+"),
+            "failure_pattern is not a valid": dict(good, failure_pattern="(unclosed"),
+        }
+        config = self.tmp / "config.json"
+        for message, data in cases.items():
+            with self.subTest(message=message):
+                config.write_text(json.dumps(data))
+                with self.assertRaises(SystemExit) as stop:
+                    audit.load_config(str(config))
+                self.assertIn(message.strip(), str(stop.exception.code))
+        config.write_text(json.dumps(good))
+        self.assertEqual(audit.load_config(str(config))["workers"], 4)
+
+    def test_config_text_cannot_change_report_structure(self):
+        """A probe name or exclusion reason with Markdown stays one table cell or one list item."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        res["probes"][0]["probe"] = "x | injected | cell\n### Heading"
+        for row in res["not_tried"]:
+            if row["reason"] == "excluded":
+                row["detail"] = "see [link](https://example.com) @someone\n- fake item <b>"
+        report = audit.render({}, res)
+        probe_row = next(l for l in report.splitlines() if l.startswith("| x"))
+        self.assertEqual(probe_row.count(" | "), 3, probe_row)  # four cells, as the header has
+        self.assertNotIn("\n### Heading", report)
+        self.assertNotIn("\n- fake item", report)
+        self.assertIn("\\[link\\](https://example.com) \\@someone", report)
+
+    @unittest.skipIf(os.name == "nt", "checks for unreaped children with os.waitpid")
+    def test_failed_extraction_leaves_no_git_process(self):
+        """A file name the file system refuses fails the export, and git archive is stopped and reaped."""
+        src = self.tmp / "src"
+        src.mkdir()
+        git_in(src, "init", "-q")
+        # A name too long for the file system comes first; a large file keeps git archive writing.
+        tree = mktree(src, [("100644", "0" * 300, "x"), ("100644", "big", "y" * (8 << 20))])
+        head = git_in(src, "commit-tree", tree, "-m", "c")
+        git_in(src, "update-ref", "refs/audit/base", head)
+        bundle = self.tmp / "b.bundle"
+        git_in(src, "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        cfg = dict(UNITTEST, python=sys.executable, test_timeout=60)
+        ws = audit.Workspace(cfg, {"base_sha": head, "prs": []}, bundle, self.tmp / "work")
+        with self.assertRaises(OSError):
+            ws.export(head)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(-1, os.WNOHANG)
 
 
 class Packaging(unittest.TestCase):

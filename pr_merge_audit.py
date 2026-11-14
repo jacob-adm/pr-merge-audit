@@ -88,10 +88,28 @@ def load_config(path):
     # The test command is the only mandatory setting.
     if not cfg.get("test_cmd"):
         sys.exit(f"{path}: test_cmd is required")
+    if not argv_list(cfg["test_cmd"]):
+        sys.exit(f"{path}: test_cmd must be a non-empty list of string arguments")
     # Every probe must say how to run it.
     for probe in cfg.get("probes", []):
         if not probe.get("cmd"):
             sys.exit(f"{path}: probe {probe.get('name')!r} needs a cmd")
+        if not argv_list(probe["cmd"]):
+            sys.exit(f"{path}: probe {probe.get('name')!r}: cmd must be a non-empty list of string arguments")
+    # Numbers that size the run must be positive; bool is excluded, as JSON true is not a count.
+    for key, kinds in (("workers", (int,)), ("test_timeout", (int, float))):
+        value = cfg.get(key, 1)
+        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
+            sys.exit(f"{path}: {key} must be a positive number, not {value!r}")
+    # Output patterns are read through their first group, so each must compile and have one.
+    for key in ("failure_pattern", "count_pattern", "skipped_pattern", "message_pattern"):
+        if cfg.get(key):
+            try:
+                groups = re.compile(cfg[key]).groups
+            except (re.error, TypeError) as exc:
+                sys.exit(f"{path}: {key} is not a valid regular expression: {exc}")
+            if groups < 1:
+                sys.exit(f"{path}: {key} needs a capturing group, read as group 1")
     # Defaults: the current interpreter, a tests/ directory, a 30-minute run limit, 4 workers.
     cfg.setdefault("python", sys.executable)
     cfg.setdefault("test_prefix", "tests/")
@@ -119,6 +137,11 @@ def load_config(path):
     # Probe files are resolved relative to the configuration file.
     cfg["_dir"] = Path(path).resolve().parent
     return cfg
+
+
+def argv_list(value):
+    """Whether `value` is a non-empty JSON list of strings, the form of every command."""
+    return isinstance(value, list) and bool(value) and all(isinstance(a, str) for a in value)
 
 
 def fill(args, **values):
@@ -151,9 +174,12 @@ def windows_job(proc):
     job = k32.CreateJobObjectW(None, None)
     if job and k32.AssignProcessToJobObject(job, int(proc._handle)):
         return job
-    # Assignment failed: release the job and fall back to stopping the single process.
+    # Assignment failed: release the job and fall back to stopping the single process, and say so,
+    # since processes the tests start in the background may then outlive the run.
     if job:
         k32.CloseHandle(wintypes.HANDLE(job))
+    print(f"warning: could not put test process {proc.pid} in a job object (error {ctypes.get_last_error()}); "
+          "processes it starts may survive the run", file=sys.stderr)
     return None
 
 
@@ -229,6 +255,24 @@ def check_git():
     if git_version(found) < MIN_GIT:
         sys.exit(f"git {MIN_GIT[0]}.{MIN_GIT[1]} or later is needed (for `git merge-tree --write-tree`); "
                  f"found: {found or 'no git on PATH'}")
+
+
+def check_snapshot(snap):
+    """Stop before any work if the snapshot has malformed commit ids or a PR number twice."""
+    base = str(snap.get("base_sha", ""))
+    # One id length for every commit: 40 hex digits (SHA-1) or 64 (SHA-256), lowercase as git prints.
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
+        sys.exit(f"snapshot: base_sha {base!r} is not a full commit id")
+    seen = set()
+    for p in snap["prs"]:
+        n = p.get("number")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            sys.exit(f"snapshot: PR number {n!r} is not a positive integer")
+        if n in seen:
+            sys.exit(f"snapshot: PR #{n} is listed twice")
+        seen.add(n)
+        if not re.fullmatch(r"[0-9a-f]{%d}" % len(base), str(p.get("head", ""))):
+            sys.exit(f"snapshot: PR #{n} head {p.get('head')!r} is not a full commit id like base_sha")
 
 
 def probe_dest(cfg, probe):
@@ -528,6 +572,8 @@ class Workspace:
     def __init__(self, cfg, snap, bundle, work):
         """Create a fresh workspace under `work` and load the snapshot bundle into it."""
         # Paths, synchronisation primitives and per-phase counters.
+        # A malformed snapshot is refused before anything is created.
+        check_snapshot(snap)
         self.cfg, self.snap = cfg, snap
         self.work = Path(work).resolve()
         self.repo = self.work / "repo"
@@ -554,6 +600,23 @@ class Workspace:
         # Commit ids for the base and each PR head.
         self.base = snap["base_sha"]
         self.heads = {p["number"]: p["head"] for p in snap["prs"]}
+        # Every commit the snapshot names must be the one the bundle holds under that name.
+        mismatch = self.bundle_mismatch()
+        if mismatch:
+            remove_tree(self.work)
+            sys.exit(f"snapshot and bundle disagree: {mismatch}")
+
+    def bundle_mismatch(self):
+        """The first base or PR whose commit in the snapshot differs from the bundle's ref, else None."""
+        # Every ref the bundle brought in, by name.
+        out = git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/audit").stdout
+        have = dict(line.split(" ", 1) for line in out.splitlines())
+        want = [("base", "refs/audit/base", self.base)]
+        want += [(f"PR #{n}", f"refs/audit/pr/{n}", head) for n, head in self.heads.items()]
+        for what, ref, sha in want:
+            if have.get(ref) != sha:
+                return f"{what} is {sha} in the snapshot but {have.get(ref) or 'missing'} in the bundle ({ref})"
+        return None
 
     def ref(self, n):
         """Commit for a target: the base, or the head of PR `n`."""
@@ -633,6 +696,7 @@ class Workspace:
         root = scratch / "src"
         for d in (root, scratch / "home", scratch / "tmp"):
             d.mkdir()
+        proc = None
         try:
             # Stream `git archive` and extract member by member, refusing anything that could escape `root`.
             proc = subprocess.Popen(["git", "-c", "core.hooksPath=" + os.devnull, "archive", "--format=tar", commit],
@@ -650,6 +714,12 @@ class Workspace:
             prune_links(root)
         # Never leave a half-built export behind, even on interrupt.
         except BaseException:
+            # Stop and reap git archive too, so a failed extraction leaves no process behind.
+            if proc:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.stdout.close()
+                proc.wait()
             remove_tree(scratch)
             raise
         return scratch, root
@@ -1038,10 +1108,19 @@ def emit_branch(ws, gitdir, ref, tip):
     # The ref may have become a symbolic ref during the build; check again right before writing.
     if symref(gitdir, ref):
         raise RuntimeError(f"{ref} is now a symbolic ref to {symref(gitdir, ref)}")
-    # Create the branch; the empty old value makes git refuse if the ref exists by now. The reflog
-    # entry carries the operator's own identity and the real time, not the fixed merge identity;
-    # the commit itself, and so its id, are unchanged.
-    git(gitdir, "update-ref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
+    write_branch(gitdir, ref, tip)
+
+
+def write_branch(gitdir, ref, tip):
+    """Create `ref` at `tip`, writing that ref itself and never the branch a symbolic ref points to.
+
+    The empty old value makes git refuse if the ref exists, including a symbolic ref to an existing
+    branch. --no-deref stops git following a symbolic ref created after the last check; recent git
+    (2.56) also refuses a dangling one, while older git (2.50) replaces it with the branch itself.
+    The reflog entry carries the operator's own identity and the real time, not the fixed merge
+    identity; the commit itself, and so its id, are unchanged.
+    """
+    git(gitdir, "update-ref", "--no-deref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
 
 
 def cmd_build(cfg, args):
@@ -1197,6 +1276,15 @@ def clean(text, table=False):
     if len(text) > 200:
         text = text[:200] + "..."
     return text.replace("|", "\\|") if table else text
+
+
+def prose(text):
+    """Configuration or snapshot text shown as plain Markdown: one line, punctuation escaped.
+
+    Keeps a name or reason from adding table cells, list items, links, mentions or HTML.
+    """
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text))
+    return re.sub(r"([\\`*_\[\]<>|#!~&@])", r"\\\1", text)
 
 
 def refs(ns):
@@ -1380,7 +1468,7 @@ def render(cfg, res):
         w("|---|---|---|---|")
         for p in res["probes"]:
             t = f"`{snap['base_ref']}`" if p["target"] == "base" else f"#{p['target']}"
-            w(f"| {p['probe']} | {t} | {p['outcome']} | {('`' + clean(p['message'], table=True) + '`') if p['message'] else ''} |")
+            w(f"| {prose(p['probe'])} | {t} | {p['outcome']} | {('`' + clean(p['message'], table=True) + '`') if p['message'] else ''} |")
         w("")
 
     # PRs not tried, grouped by reason, in a fixed order.
@@ -1403,9 +1491,9 @@ def render(cfg, res):
         if key in ("excluded", "duplicate"):
             w(f"- **{label}:**")
             for r in rows:
-                w(f"  - #{r['pr']}: {r['detail']}")
+                w(f"  - #{r['pr']}: {prose(r['detail'])}")
         elif key == "status":
-            w(f"- **{label}:** " + ", ".join(f"#{r['pr']} ({r['detail']})" for r in rows))
+            w(f"- **{label}:** " + ", ".join(f"#{r['pr']} ({prose(r['detail'])})" for r in rows))
         else:
             w(f"- **{label}:** {refs(r['pr'] for r in rows)}")
     if res["not_tried"]:
