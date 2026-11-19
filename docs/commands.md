@@ -27,6 +27,21 @@ It is the only GitHub-specific step and the only one that uses the network. It n
 (github.com, or GitHub Enterprise through `api`). Optional: `GITHUB_TOKEN` in the environment
 (unauthenticated API access is rate-limited).
 
+### Private repositories
+
+`GITHUB_TOKEN` is used only for the API. The PR heads are fetched from `remote` with git, which runs
+without your credentials or git configuration, so `remote` must be readable without them. For a
+private repository, fetch the pull request heads into a local mirror with your own credentials and
+point `remote` at it:
+
+```
+git clone --bare https://github.com/OWNER/NAME.git mirror.git
+git -C mirror.git fetch origin '+refs/pull/*/head:refs/pull/*/head'
+```
+
+Then set `"remote": "/path/to/mirror.git"` and run `snapshot` with `GITHUB_TOKEN` set. Run the same
+`fetch` again before each snapshot so the mirror has the current PR heads.
+
 ### Other hosts
 
 For another host (GitLab, Gitea, Bitbucket), write the two snapshot files yourself and run

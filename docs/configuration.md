@@ -15,8 +15,8 @@ file kept with that project, not here. `config.example.json` is a starting point
 | `skipped_pattern`, `message_pattern` | Regexes for the skipped count and the first error message |
 | `test_files` | Regex for test files, used to decide whether a PR changes tests (default: anything under `test_prefix`) |
 | `python`, `workers` | Interpreter for tests (default: the one running the tool), parallel jobs |
-| `pass_env` | Names of variables copied from your environment into test runs (e.g. `RUSTUP_HOME`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`) |
-| `env` | Variables set in test runs, applied last (can override `HOME`) |
+| `pass_env` | Names of variables copied from your environment into test runs, if they are set (e.g. `RUSTUP_HOME`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`) |
+| `env` | Variables set in test runs, applied last (can override `HOME`). Test runs have their own `HOME`, so a toolchain that finds itself under your home directory by default needs its location here, for example rustup and cargo: `{"RUSTUP_HOME": "/Users/me/.rustup", "CARGO_HOME": "/Users/me/.cargo"}` |
 | `allow_incomplete_checkout` | Run even though the base uses submodules or Git LFS, which test runs lack (shown in the report) |
 | `setup_cmd` | Command run before `test_cmd` in the same copy (e.g. installing dependencies); if it fails, the run fails as `(setup failed)` |
 | `order` | Merge order; it decides which side of each conflict merged first |
