@@ -87,6 +87,8 @@ each project's config, snapshots and results in a directory of its own.
 - [Security](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/security.md): what runs as you, and what the tool does to limit
   damage.
 - [Testing](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/testing.md): the test suite and the golden-report self-check.
+- [Using it with other tools](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/other-tools.md): landing a batch with
+  git-overlap first and git surface on the kept branch.
 - [Contributing](https://github.com/jacob-adm/pr-merge-audit/blob/main/CONTRIBUTING.md): how the project is developed and what is enforced.
 - [Reporting a vulnerability](https://github.com/jacob-adm/pr-merge-audit/blob/main/SECURITY.md)
 
