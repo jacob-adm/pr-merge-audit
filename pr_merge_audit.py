@@ -1386,11 +1386,11 @@ def render(cfg, res):
             w(f"| #{n} | {refs(swaps[n]['blockers']) or '(only the combined build)'} |")
         w("")
 
-    # Section: conflicts whose tests still fail after the swap. Culprit pairs found here are
-    # collected for the next section.
+    # Section: conflicts whose swap test did not pass (tests fail or are flaky, the swap still
+    # conflicts, or it could not run). Culprit pairs found here are collected for the next section.
     pairs = []
     if bad_swaps:
-        w(f"### Tests fail even after swapping ({len(bad_swaps)})")
+        w(f"### Swap test did not pass ({len(bad_swaps)})")
         w("")
     # One line per PR, worded by what happened to its swap test.
     for n in bad_swaps:

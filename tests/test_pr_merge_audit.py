@@ -969,6 +969,16 @@ class Helpers(unittest.TestCase):
         self.assertIn(f"**#{n}:** conflicts with the combined build only; still conflicts", text)
         self.assertNotIn("with ;", text)
 
+    def test_unresolved_swap_heading_claims_no_test_failure(self):
+        """A swap that never ran the tests is not listed under a heading saying the tests fail."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        n = str(res["order"][-1])
+        for outcome in ("conflict", "revert_conflict", "error"):
+            res["swaps"][n] = {"blockers": [], "outcome": outcome}
+            text = audit.render({}, res)
+            self.assertIn("### Swap test did not pass (", text)
+            self.assertNotIn("Tests fail even after swapping", text)
+
     def test_names_keeps_spaces(self):
         """NUL-separated path lists keep spaces inside names."""
         self.assertEqual(audit.names("a b.py\0c.py\0"), ["a b.py", "c.py"])
