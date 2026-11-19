@@ -1,0 +1,5 @@
+# The tests read the golden files, the docs, CONTRIBUTING.md and the CI workflow; ship them so the sdist can run them.
+include CONTRIBUTING.md SECURITY.md config.example.json .github/workflows/test.yml
+graft docs
+graft tests
+global-exclude *.py[cod] __pycache__

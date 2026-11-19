@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "pr-merge-audit"
 version = "1.2.1"
 description = "Merge-test a repository's open pull requests together and report which combine, conflict or break each other's tests."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.8"
 dependencies = []
 classifiers = [
