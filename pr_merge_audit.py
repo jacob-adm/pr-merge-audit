@@ -8,7 +8,7 @@
 
 """Merge-test the open pull requests of a repository and report how they combine.
 
-Needs only the Python standard library (3.8+) and git (2.38+, for `git merge-tree --write-tree`).
+Needs only the Python standard library (3.9+) and git (2.38+, for `git merge-tree --write-tree`).
 
     pr_merge_audit.py --config config.json snapshot                                # network: freeze PR heads
     pr_merge_audit.py --config config.json build --snapshot snapshots/DATE.json    # offline; runs PR code
@@ -20,7 +20,7 @@ Only `snapshot` uses the network (a GitHub-compatible API). The same snapshot, c
 give the same report.
 """
 
-# Standard library only, by design: the tool must install and run anywhere Python 3.8+ does.
+# Standard library only, by design: the tool must install and run anywhere Python 3.9+ does.
 import argparse
 import concurrent.futures
 import datetime
