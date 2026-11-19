@@ -10,7 +10,7 @@ project.
 
 ## Requirements
 
-- Python 3.8 or later, standard library only.
+- Python 3.9 or later, standard library only.
 - git 2.38 or later (`git merge-tree --write-tree`).
 - Linux, macOS or Windows.
 - For `snapshot` only: GitHub (github.com, or GitHub Enterprise). Optional: `GITHUB_TOKEN` in

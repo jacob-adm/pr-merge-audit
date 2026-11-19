@@ -10,7 +10,7 @@ the same steps:
 2. **Branch.** Work happens on `feature/<KEY>-<slug>`, never on `main`.
 3. **Falsifiable test.** Each change comes with a test that fails without it. The full suite must pass:
    `python3 -m unittest discover -s tests`.
-4. **Pull request.** A PR to `main`, with CI on Linux, macOS and Windows, Python 3.8 and 3.13.
+4. **Pull request.** A PR to `main`, with CI on Linux, macOS and Windows, Python 3.9 and 3.13.
 5. **Review.** An automated review by the agent (tests, doctrine checks), then sign-off by the
    maintainer.
 6. **Merge.** `git merge --no-ff`, so every change stays one merge commit on `main`.
