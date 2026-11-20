@@ -9,7 +9,8 @@
 - **Merging:** each PR is merged with `git merge --no-ff` onto the build so far, in a fixed order taken from the configuration; PRs not listed there follow in PR-number order.
   - If a merge conflicts, it's aborted and the PR is recorded as conflicting.
   - If tests fail after a merge, they are run once more; if they fail again the merge is reset and the PR is recorded as failing. A pass on the second run is recorded as flaky and also reset.
-- **Swap test:** for each conflicting PR, the merged PR(s) it conflicts with on its own (`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.
+- **Base conflicts:** a conflicting PR that does not merge onto the base by itself is listed as conflicting with the base and is not tested further.
+- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own (`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.
 - **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair is then merged onto the base alone and tested.
 - **Rules:** status check: `ci` must pass; a PR counts as changing tests if a file matches `^tests/`; 6 PRs have a configured position in the order. Exclusions, duplicates and features are listed under Not tried.
 

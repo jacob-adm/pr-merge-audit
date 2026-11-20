@@ -918,6 +918,10 @@ def find_culprit(ws, n, seq, name):
 def swap(ws, n, merged, tip):
     """Revert the merged PRs that conflict with `n`, merge `n` and run the tests."""
     ws.phase("swap")
+    # A PR that does not merge onto the base alone conflicts with the base, not with other PRs:
+    # there is nothing to swap, and naming merged PRs as its blockers would be wrong.
+    if ws.conflicts(n, "base"):
+        return {"blockers": [], "outcome": "base_conflict"}
     # Blockers are the merged PRs that conflict with PR `n` on their own.
     blockers = [m["pr"] for m in merged if ws.conflicts(n, m["pr"])]
     # Work on a copy of the combined build.
@@ -1337,7 +1341,9 @@ def render(cfg, res):
     w("  - If a merge conflicts, it's aborted and the PR is recorded as conflicting.")
     w("  - If tests fail after a merge, they are run once more; if they fail again the merge is reset "
       "and the PR is recorded as failing. A pass on the second run is recorded as flaky and also reset.")
-    w("- **Swap test:** for each conflicting PR, the merged PR(s) it conflicts with on its own "
+    w("- **Base conflicts:** a conflicting PR that does not merge onto the base by itself is listed as "
+      "conflicting with the base and is not tested further.")
+    w("- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own "
       "(`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.")
     w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
       "its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair "
@@ -1371,9 +1377,20 @@ def render(cfg, res):
         w("### Result: no PRs were eligible to try")
     w("")
 
-    # Conflicting PRs, split by whether their tests pass once swapped in.
+    # Conflicting PRs: first those that conflict with the base itself, then the rest, split by
+    # whether their tests pass once swapped in.
+    on_base = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") == "base_conflict"]
     ok_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") == "pass"]
-    bad_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") != "pass"]
+    bad_swaps = [n for n in res["order"] if n in swaps and swaps[n].get("outcome") not in ("pass", "base_conflict")]
+    # Section: PRs that do not merge onto the base alone.
+    if on_base:
+        w(f"### Conflict with `{snap['base_ref']}` ({len(on_base)})")
+        w("")
+        w(f"These PRs do not merge onto `{snap['base_ref']}` by itself, so they were not compared with the other PRs. "
+          f"Each needs a rebase or a merge of `{snap['base_ref']}` first.")
+        w("")
+        w(refs(on_base))
+        w("")
     # Section: text conflicts that pass once swapped in.
     if ok_swaps:
         w(f"### Text conflicts; tests pass once swapped in ({len(ok_swaps)})")

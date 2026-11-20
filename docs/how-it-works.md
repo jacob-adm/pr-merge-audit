@@ -14,7 +14,9 @@ same report.
    configured order (unlisted PRs follow by number). The test command runs after each merge.
    A conflict is aborted; a test failure is re-run once and the merge is reset. A failure that
    passes on re-run is recorded as flaky.
-3. **Swap test.** For each conflicting PR, the merged PRs it conflicts with pairwise
+3. **Swap test.** A conflicting PR that does not merge onto the base by itself is listed as
+   conflicting with the base and is not tested further: it needs a rebase, and no other PR is the
+   cause. For each other conflicting PR, the merged PRs it conflicts with pairwise
    (`git merge-tree`) are reverted, the PR is merged in their place, and the tests run.
 4. **Culprit search.** For each PR that fails tests without a text conflict, or still fails after
    its swap, the merge sequence is bisected for a PR that makes it fail, and that pair is tested
