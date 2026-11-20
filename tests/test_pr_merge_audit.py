@@ -505,6 +505,37 @@ class SmallBuilds(unittest.TestCase):
         self.assertNotIn("Serial landing", text)
         self.assertNotIn("\n\n\n", text)
 
+    def test_conflict_with_the_base_has_its_own_section(self):
+        """A PR that cannot merge onto the base alone is not attributed to other PRs or swap-tested."""
+        repo = self.tmp / "src"
+        repo.mkdir()
+        sh(repo, "git", "init", "-q", "-b", "main")
+        commit(repo, {"app.py": "X = 1\n", "tests/test_base.py": PASSING}, "base")
+        stale = branch(repo, "p1", {"app.py": "X = 2\n", "tests/test_p1.py": PASSING})
+        fresh = branch(repo, "p2", {"other.py": "Y = 1\n", "tests/test_p2.py": PASSING})
+        base = commit(repo, {"app.py": "X = 3\n"}, "base moves on")
+        sh(repo, "git", "update-ref", "refs/audit/base", base)
+        sh(repo, "git", "update-ref", "refs/audit/pr/1", stale)
+        sh(repo, "git", "update-ref", "refs/audit/pr/2", fresh)
+        bundle = self.tmp / "snap.bundle"
+        sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        snap = self.tmp / "snap.json"
+        snap.write_text(json.dumps({
+            "date": "test", "repo": "local/test", "base_ref": "main", "base_sha": base,
+            "prs": [{"number": n, "title": f"p{n}", "head": h, "draft": False, "status": "SUCCESS",
+                     "files": [f"tests/test_p{n}.py"]} for n, h in ((1, stale), (2, fresh))]}))
+        config = self.tmp / "config.json"
+        config.write_text(json.dumps(dict(UNITTEST, repo="local/test", base="main", workers=1)))
+        cfg = audit.load_config(str(config))
+        res = build(cfg, snap, bundle, self.tmp, "a")
+        self.assertEqual(res["merged"], [2])
+        self.assertEqual(res["swaps"], {"1": {"blockers": [], "outcome": "base_conflict"}})
+        text = audit.render(cfg, res)
+        self.assertIn("### Conflict with `main` (1)", text)
+        self.assertIn("\n#1\n", text)
+        self.assertNotIn("Swap test did not pass", text)
+        self.assertNotIn("Text conflicts", text)
+
     def test_ignore_status_is_applied_and_shown(self):
         """--ignore-status tries failing-status PRs and says so in the report."""
         cfg, snap, bundle = small_project(self.tmp, PASSING, "FAILURE")
