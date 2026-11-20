@@ -59,6 +59,13 @@ For another host (GitLab, Gitea, Bitbucket), write the two snapshot files yourse
 and writes `results/DATE.json` (or `--out`). `--ignore-status` tries PRs whatever their required
 status check says; the report shows that it was used.
 
+`--merge-only` runs no tests, setup command or probes, so no code from any PR is executed. A PR
+counts as merged when `git merge` succeeds. It needs no `test_cmd`, tries PRs that change no
+tests, and skips the checks for submodules and Git LFS, which only matter to test runs. The
+report says at the top that no tests were run, lists the PRs that conflict with the base and the
+text conflicts between PRs, and leaves out the test-run counts. It cannot be combined with
+`--emit-branch`, which needs a tested build.
+
 `build` refuses a snapshot whose `base_sha` or a PR's `head` is not a full commit id, that lists a
 PR number twice, or whose ids differ from the bundle's refs, before any test runs.
 

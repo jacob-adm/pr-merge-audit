@@ -78,16 +78,22 @@ PASS_ENV = ("PATH", "SYSTEMROOT", "PATHEXT", "COMSPEC", "SYSTEMDRIVE", "WINDIR",
             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
 
 
-def load_config(path):
+def load_config(path, merge_only=False):
     """Read and validate the project configuration, then fill in defaults.
 
     Exits with a message on invalid input, so a misconfiguration fails before any work starts.
+    With `merge_only`, nothing is run: no test command is needed and probes are dropped.
     """
     # Parse the JSON configuration file.
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    cfg["merge_only"] = bool(merge_only)
+    if merge_only:
+        cfg["_probes_dropped"] = len(cfg.get("probes", []))
+        cfg.update(test_cmd=["(none)"], probes=[])
+        cfg.pop("setup_cmd", None)
     # The test command is the only mandatory setting.
     if not cfg.get("test_cmd"):
-        sys.exit(f"{path}: test_cmd is required")
+        sys.exit(f"{path}: test_cmd is required (or run build with --merge-only)")
     if not argv_list(cfg["test_cmd"]):
         sys.exit(f"{path}: test_cmd must be a non-empty list of string arguments")
     # Every probe must say how to run it.
@@ -549,7 +555,7 @@ def classify(cfg, snap):
             reason, detail = "duplicate", cfg["duplicates"][n]
         elif n in cfg["features"]:
             reason, detail = "feature", cfg["features"][n]
-        elif not has_tests and n not in cfg["no_tests_ok"]:
+        elif not has_tests and n not in cfg["no_tests_ok"] and not cfg.get("merge_only"):
             reason, detail = "no_tests", ""
         # No rule matched: the PR is eligible.
         else:
@@ -814,6 +820,9 @@ class Workspace:
 
         A pass on the re-run is reported as `flaky`; two failures report the first run's result.
         """
+        # Merge-only: a merge that succeeds is the whole test; nothing is exported or run.
+        if self.cfg.get("merge_only"):
+            return {"outcome": "pass", "ran": 0, "skipped": 0}
         # Default to the configured test command.
         argv = argv or fill(self.cfg["test_cmd"], python=self.cfg["python"])
         first = self.test_once(wt, argv)
@@ -1140,10 +1149,18 @@ def cmd_build(cfg, args):
     emit_to = check_emit(args, snap)
     # The bundle sits next to the snapshot unless given explicitly.
     bundle = args.bundle or str(Path(args.snapshot).with_suffix(".bundle"))
-    print("note: this runs code from every PR it tries; use a disposable machine without credentials",
+    merge_only = bool(cfg.get("merge_only"))
+    if merge_only and args.emit_branch:
+        sys.exit("--emit-branch needs a tested build; it cannot be combined with --merge-only")
+    print("note: merge-only, no code from any PR is run" if merge_only else
+          "note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
     # Every deviation from the default rules is recorded and shown at the top of the report.
     overrides = []
+    if merge_only:
+        dropped = cfg.get("_probes_dropped")
+        overrides.append("merge-only run: no tests were run and no code from any PR was executed"
+                         + (f"; {dropped} configured probe(s) not run" if dropped else ""))
     # Operator chose to try PRs regardless of their required check.
     if args.ignore_status and cfg.get("required_status"):
         overrides.append(f"required status check `{cfg['required_status']}` ignored")
@@ -1152,7 +1169,8 @@ def cmd_build(cfg, args):
     started = time.monotonic()
     ws = Workspace(cfg, snap, bundle, args.work)
     # Pre-flight: stop if test runs would lack submodules or LFS content, unless explicitly allowed.
-    missing = " and ".join(ws.incomplete_checkout(ws.base))
+    # A merge-only build has no test runs, so content they would lack does not matter.
+    missing = "" if merge_only else " and ".join(ws.incomplete_checkout(ws.base))
     if missing and not cfg.get("allow_incomplete_checkout"):
         remove_tree(ws.work)
         sys.exit(f"the base {snap['base_sha'][:7]} uses {missing}, which test runs would not contain; "
@@ -1161,7 +1179,7 @@ def cmd_build(cfg, args):
         overrides.append(f"test runs lack {missing} (allow_incomplete_checkout)")
     # Decide which PRs to try, then check their heads for content test runs would lack.
     seq, not_tried = classify(cfg, snap)
-    lacking = {n: ws.incomplete_checkout(ws.heads[n]) for n in seq}
+    lacking = {} if merge_only else {n: ws.incomplete_checkout(ws.heads[n]) for n in seq}
     lacking = ", ".join(f"#{n} ({' and '.join(m)})" for n, m in lacking.items() if m)
     if lacking and not cfg.get("allow_incomplete_checkout"):
         remove_tree(ws.work)
@@ -1227,6 +1245,7 @@ def cmd_build(cfg, args):
         },
         "base_tests": base_result,
         "final_tests": final,
+        "merge_only": merge_only,
         "order": seq,
         "not_tried": not_tried,
         "steps": steps,
@@ -1334,7 +1353,11 @@ def render(cfg, res):
     w(f"- **Environment:** {py}git {tools['git']}, {tools['os']}.")
     skipped = res["final_tests"].get("skipped", 0)
     note = f" {skipped} tests were skipped in the final run." if skipped else ""
-    w(f"- **Test run:** `{res['test_cmd']}` after every merge.{note}")
+    merge_only = res.get("merge_only")
+    if merge_only:
+        w("- **Test run:** none. This is a merge-only run: a PR counts as merged when `git merge` succeeds.")
+    else:
+        w(f"- **Test run:** `{res['test_cmd']}` after every merge.{note}")
     # How each phase works, in plain terms.
     w("- **Merging:** each PR is merged with `git merge --no-ff` onto the build so far, in a fixed order "
       "taken from the configuration; PRs not listed there follow in PR-number order.")
@@ -1370,7 +1393,8 @@ def render(cfg, res):
     # Headline: how many of the tried PRs combine with all tests passing.
     merged = res["merged"]
     if tried:
-        w(f"### Result: {len(merged)} of {tried} PRs merged together with every test passing")
+        how = "without a text conflict (no tests run)" if merge_only else "with every test passing"
+        w(f"### Result: {len(merged)} of {tried} PRs merged together {how}")
         w("")
         w(refs(merged) or "None of them merged.")
     else:
@@ -1393,7 +1417,8 @@ def render(cfg, res):
         w("")
     # Section: text conflicts that pass once swapped in.
     if ok_swaps:
-        w(f"### Text conflicts; tests pass once swapped in ({len(ok_swaps)})")
+        title = "Text conflicts between PRs" if merge_only else "Text conflicts; tests pass once swapped in"
+        w(f"### {title} ({len(ok_swaps)})")
         w("")
         w("Each pair changes the same lines. One may replace the other, or a rebase may combine them.")
         w("")
@@ -1517,7 +1542,9 @@ def render(cfg, res):
         w("")
     # Cost summary, so readers can estimate the effort of a re-run.
     runs = res.get("test_runs")
-    # Footer: how many test-suite runs the build took.
+    # Footer: how many test-suite runs the build took. A merge-only build took none.
+    if merge_only:
+        runs = tried = None
     if runs:
         total = runs["sequence"] + runs["swap"] + runs["culprit"] + runs["probe"]
         w(f"**Test-suite runs:** {total} in total: {runs['sequence']} for the sequential build, "
@@ -1540,7 +1567,11 @@ def render(cfg, res):
           f"The `estimate` command converts these counts to hours using a build's measured run times.")
         w("")
     # Closing caveat on what the results prove.
-    w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
+    if merge_only:
+        w("A merge without a text conflict only shows that the changes do not overlap. "
+          "It doesn't show the PRs work together; that takes a build with tests.")
+    else:
+        w("Tests passing only shows that the PRs combine. It doesn't show each fix is correct.")
     return "\n".join(L) + "\n"
 
 
@@ -1642,6 +1673,9 @@ def main():
     b.add_argument("--out")
     b.add_argument("--ignore-status", action="store_true",
                    help="try PRs whatever their required status check says (shown in the report)")
+    b.add_argument("--merge-only", action="store_true",
+                   help="only merge: run no tests, setup or probes, so no code from any PR is executed; "
+                        "tries every PR and needs no test_cmd")
     b.add_argument("--emit-branch", metavar="REF",
                    help="create branch REF (e.g. refs/heads/integration) at the merged, passing build; never overwrites")
     b.add_argument("--emit-repo", metavar="PATH", help="local git repository that receives --emit-branch; nothing is pushed")
@@ -1662,7 +1696,8 @@ def main():
     # Parse, load the configuration where needed, and dispatch.
     args = ap.parse_args()
     # report and verify read only a results file, so they need no project config.
-    cfg = load_config(args.config) if args.cmd in ("snapshot", "build", "estimate") else {}
+    merge_only = getattr(args, "merge_only", False)
+    cfg = load_config(args.config, merge_only) if args.cmd in ("snapshot", "build", "estimate") else {}
     {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify, "estimate": cmd_estimate}[args.cmd](cfg, args)
 
 
