@@ -1475,15 +1475,22 @@ def render(cfg, res):
     w("- **Merging:** each PR is merged with `git merge --no-ff` onto the build so far, in a fixed order "
       "taken from the configuration; PRs not listed there follow in PR-number order.")
     w("  - If a merge conflicts, it's aborted and the PR is recorded as conflicting.")
-    w("  - If tests fail after a merge, they are run once more; if they fail again the merge is reset "
-      "and the PR is recorded as failing. A pass on the second run is recorded as flaky and also reset.")
-    w("- **Base conflicts:** a conflicting PR that does not merge onto the base by itself is listed as "
-      "conflicting with the base and is not tested further.")
-    w("- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own "
-      "(`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.")
-    w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
-      "its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair "
-      "is then merged onto the base alone and tested.")
+    # A merge-only run has no test, retry or culprit step, so its Procedure names none.
+    if merge_only:
+        w("- **Base conflicts:** a conflicting PR that does not merge onto the base by itself is listed as "
+          "conflicting with the base and is not compared with the other PRs.")
+        w("- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own "
+          "(`git merge-tree`) are reverted and it is merged in their place.")
+    else:
+        w("  - If tests fail after a merge, they are run once more; if they fail again the merge is reset "
+          "and the PR is recorded as failing. A pass on the second run is recorded as flaky and also reset.")
+        w("- **Base conflicts:** a conflicting PR that does not merge onto the base by itself is listed as "
+          "conflicting with the base and is not tested further.")
+        w("- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own "
+          "(`git merge-tree`) are reverted, it is merged in their place, and the tests are run again.")
+        w("- **Culprit search:** for each PR whose tests fail with no text conflict, or still fail after "
+          "its swap, the merge sequence is bisected for a merged PR that makes it fail; that pair "
+          "is then merged onto the base alone and tested.")
     # The selection rules in force.
     if rules:
         status = f"`{rules['required_status']}` must pass" if rules["required_status"] else "none required"
@@ -1523,7 +1530,7 @@ def render(cfg, res):
     if on_base:
         w(f"### Conflict with `{snap['base_ref']}` ({len(on_base)})")
         w("")
-        w(f"These PRs do not merge onto `{snap['base_ref']}` by itself, so they were not compared with the other PRs. "
+        w(f"These PRs do not merge onto `{snap['base_ref']}` by themselves, so they were not compared with the other PRs. "
           f"Each needs a rebase or a merge of `{snap['base_ref']}` first.")
         w("")
         w(refs(on_base))
