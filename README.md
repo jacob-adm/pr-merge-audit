@@ -4,7 +4,8 @@ Merge-tests the open pull requests of a repository against its base branch and w
 Markdown report of which PRs combine cleanly, which conflict, and which break each other's tests.
 
 No AI or network is involved after the snapshot step: the same snapshot, configuration and
-machine always produce the same report. The tool is not tied to any project, language or test
+machine produce the same report, provided the project's own tests give the same result on every
+run. `build --repeat` checks that by building twice and failing if the two reports differ. The tool is not tied to any project, language or test
 runner; everything about the repository under test is in a configuration file kept with that
 project.
 
@@ -59,6 +60,7 @@ pr-merge-audit --config CONFIG build --snapshot FILE           merge-test offlin
       [--emit-branch REF --emit-repo PATH]                     also keep the merged build as a branch
       [--ignore-status] [--out FILE]
       [--merge-only]                                           only merge: no tests, no PR code run
+      [--repeat]                                               build twice, fail if the reports differ
 pr-merge-audit report --results FILE [--out FILE]              render the Markdown report
 pr-merge-audit verify --results FILE [--golden FILE]           check the report renders the same
 pr-merge-audit --config CONFIG estimate --snapshot FILE --reference FILE   rough running time here

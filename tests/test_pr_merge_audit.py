@@ -10,7 +10,9 @@ actual build, export and report code paths, so each test exercises the behaviour
 """
 
 import argparse
+import contextlib
 import http.server
+import io
 import json
 import os
 import subprocess
@@ -143,12 +145,12 @@ def make_project(tmp):
     return audit.load_config(str(config)), snap, bundle
 
 
-def build(cfg, snap, bundle, tmp, name, ignore_status=False, emit_branch=None, emit_repo=None):
+def build(cfg, snap, bundle, tmp, name, ignore_status=False, emit_branch=None, emit_repo=None, repeat=False):
     """Run the real `build` command on a fixture and return the parsed results file."""
     out = tmp / f"{name}.json"
     args = argparse.Namespace(snapshot=str(snap), bundle=str(bundle), work=str(tmp / f"work-{name}"), out=str(out),
                               ignore_status=ignore_status, emit_branch=emit_branch,
-                              emit_repo=str(emit_repo) if emit_repo else None)
+                              emit_repo=str(emit_repo) if emit_repo else None, repeat=repeat)
     audit.cmd_build(cfg, args)
     return json.loads(out.read_text())
 
@@ -701,6 +703,44 @@ class SmallBuilds(unittest.TestCase):
         text = audit.render(cfg, res)
         self.assertIn("**Flaky (failed, then passed on re-run):** #1.", text)
         self.assertNotIn("no single culprit", text)
+
+    def test_repeat_records_a_reproduced_report(self):
+        """`--repeat` on a deterministic project: both builds agree, and the results and report say so."""
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = build(cfg, snap, bundle, self.tmp, "a", repeat=True)
+        first = json.loads((self.tmp / "a.repeat.json").read_text())
+        self.assertEqual((res["reproduced"], res["merged"], first["merged"]), (True, [1], [1]))
+        self.assertNotIn("reproduced", first)
+        self.assertIn("reproduced: a second build", out.getvalue())
+        self.assertIn("- **Reproduced:** a second build of the same snapshot", audit.render(cfg, res))
+        self.assertFalse((self.tmp / "work-a-repeat").exists())
+
+    def test_repeat_fails_and_emits_no_branch_when_the_reports_differ(self):
+        """`--repeat` where a test fails only on its first run: exit 1, a diff, both results kept, no branch."""
+        marker = self.tmp / "ran-once"
+        flaky = ("import os, unittest\nclass T(unittest.TestCase):\n    def test_p1(self):\n"
+                 f"        if not os.path.exists({str(marker)!r}):\n"
+                 f"            open({str(marker)!r}, 'w').close()\n            self.fail('first run')\n")
+        cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", pr_test=flaky)
+        user = self.tmp / "user"
+        sh(self.tmp, "git", "clone", "-q", str(self.tmp / "src"), str(user))
+        before = refs_of(user)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a", emit_branch="refs/heads/integration", emit_repo=user, repeat=True)
+        self.assertIn("FAIL: a second build of the same snapshot produced a different report; "
+                      "refs/heads/integration was not created", str(stop.exception.code))
+        # The first build saw the flaky failure; the second did not.
+        first = json.loads((self.tmp / "a.repeat.json").read_text())
+        second = json.loads((self.tmp / "a.json").read_text())
+        self.assertEqual((first["steps"][0]["outcome"], second["steps"][0]["outcome"]), ("flaky", "merged"))
+        self.assertIs(second["reproduced"], False)
+        self.assertNotIn("emitted", second)
+        self.assertIn("--- first build", out.getvalue())
+        self.assertIn("- **Not reproduced:**", audit.render(cfg, second))
+        self.assertEqual(refs_of(user), before)
 
     def test_estimate_prints_serial_landing_for_the_snapshot_at_the_time_measured_here(self):
         """`estimate` uses N from the snapshot and the suite time it measured, not the reference build's."""

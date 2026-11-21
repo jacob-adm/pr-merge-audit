@@ -66,6 +66,14 @@ report says at the top that no tests were run, lists the PRs that conflict with 
 text conflicts between PRs, and leaves out the test-run counts. It cannot be combined with
 `--emit-branch`, which needs a tested build.
 
+`--repeat` builds the snapshot twice and compares the two reports. The first build runs in
+`WORK-repeat` and keeps its results next to the main ones as `NAME.repeat.json`; no branch is
+emitted from it. When the reports match, the results file gains `"reproduced": true`, the report
+says so under Procedure, and the command prints `reproduced`. When they differ, the results file
+gains `"reproduced": false`, the report says so, the command prints the diff between the two
+reports, creates no branch for `--emit-branch`, and exits with status 1. A build with `--repeat`
+takes twice as long.
+
 `build` refuses a snapshot whose `base_sha` or a PR's `head` is not a full commit id, that lists a
 PR number twice, or whose ids differ from the bundle's refs, before any test runs.
 

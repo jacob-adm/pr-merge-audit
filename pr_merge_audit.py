@@ -24,6 +24,7 @@ give the same report.
 import argparse
 import concurrent.futures
 import datetime
+import difflib
 import json
 import os
 import platform
@@ -1227,6 +1228,15 @@ def cmd_build(cfg, args):
     print("note: merge-only, no code from any PR is run" if merge_only else
           "note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
+    # --repeat: build the snapshot once first, in its own work directory and with no branch emitted;
+    # this build's report is compared with that one before anything is written or emitted.
+    out = Path(args.out or f"results/{snap['date']}.json")
+    first = None
+    if getattr(args, "repeat", False):
+        first_out = out.with_name(out.stem + ".repeat.json")
+        cmd_build(cfg, argparse.Namespace(**dict(vars(args), repeat=False, emit_branch=None, emit_repo=None,
+                                                 work=str(args.work) + "-repeat", out=str(first_out))))
+        first = json.loads(first_out.read_text(encoding="utf-8"))
     # Commands after the snapshot run without network unless the config allows it; stop now if
     # that cannot be arranged. A merge-only build runs no commands.
     network = None
@@ -1336,10 +1346,16 @@ def cmd_build(cfg, args):
         "timing": timing_summary({"total": follow_ups_done - started, "sequence": sequence_done - started,
                                   "follow_ups": follow_ups_done - sequence_done}, ws.seconds),
     }
+    # With --repeat, compare the two reports; the outcome is recorded, and a difference blocks the branch.
+    diff = []
+    if first is not None:
+        diff = list(difflib.unified_diff(render(cfg, first).splitlines(True), render(cfg, results).splitlines(True),
+                                         "first build", "second build"))
+        results["reproduced"] = not diff
     # Optionally keep the sequential build's tip as a branch, with a manifest of what it holds.
     # The manifest is a results key the report never reads, so the report is unchanged.
     emit_error = None
-    if emit_to:
+    if emit_to and not diff:
         try:
             emit_branch(ws, emit_to, args.emit_branch, tip)
             results["emitted"] = {
@@ -1351,11 +1367,17 @@ def cmd_build(cfg, args):
         except RuntimeError as exc:  # the results are still worth keeping
             emit_error = str(exc)
     # Write the results file and clear the workspace.
-    out = Path(args.out or f"results/{snap['date']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     write_text(out, json.dumps(results, indent=1, sort_keys=True) + "\n")
     remove_tree(ws.work)
     print(f"wrote {out}")
+    # A report that did not reproduce fails the build, after both results files are written.
+    if diff:
+        sys.stdout.writelines(diff)
+        held_back = f"; {args.emit_branch} was not created" if emit_to else ""
+        sys.exit(f"FAIL: a second build of the same snapshot produced a different report{held_back}")
+    if first is not None:
+        print("reproduced: a second build of the same snapshot produced the same report")
     # Say where the branch went, or why it was not created.
     if emit_error:
         sys.exit(f"{args.emit_branch} was not created: {emit_error}")
@@ -1436,6 +1458,12 @@ def render(cfg, res):
     elif network:
         w("- **Network:** allowed for setup, test and probe commands (`network: allowed` in the config); "
           "their results may depend on what the network returned.")
+    if res.get("reproduced"):
+        w("- **Reproduced:** a second build of the same snapshot, in its own work directory, produced this "
+          "report exactly.")
+    elif res.get("reproduced") is False:
+        w("- **Not reproduced:** a second build of the same snapshot produced a different report, so this "
+          "report depends on more than the snapshot; the first build's results are kept beside this one.")
     skipped = res["final_tests"].get("skipped", 0)
     note = f" {skipped} tests were skipped in the final run." if skipped else ""
     merge_only = res.get("merge_only")
@@ -1682,7 +1710,6 @@ def cmd_verify(cfg, args):
     if args.golden:
         want = Path(args.golden).read_text(encoding="utf-8")
         if a != want:
-            import difflib
             sys.stdout.writelines(difflib.unified_diff(want.splitlines(True), a.splitlines(True), "golden", "rendered"))
             sys.exit("FAIL: report differs from the golden copy")
     print("PASS: report is stable" + (" and matches the golden copy" if args.golden else ""))
@@ -1764,6 +1791,9 @@ def main():
     b.add_argument("--emit-branch", metavar="REF",
                    help="create branch REF (e.g. refs/heads/integration) at the merged, passing build; never overwrites")
     b.add_argument("--emit-repo", metavar="PATH", help="local git repository that receives --emit-branch; nothing is pushed")
+    b.add_argument("--repeat", action="store_true",
+                   help="build the snapshot twice and fail if the two reports differ; the first build's "
+                        "results are kept next to --out as NAME.repeat.json")
     # report: render a results file as Markdown.
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)
