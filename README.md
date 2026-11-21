@@ -18,8 +18,9 @@ project.
   where unprivileged user namespaces are allowed, and on a machine or container with no network;
   elsewhere, including Windows, set `"network": "allowed"`. See
   [Configuration](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/configuration.md).
-- For `snapshot` only: GitHub (github.com, or GitHub Enterprise). Optional: `GITHUB_TOKEN` in
-  the environment (unauthenticated API access is rate-limited). For other hosts, see
+- For `snapshot` only: GitHub (github.com, or GitHub Enterprise Server through `api`; see
+  [Commands](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/commands.md#snapshot)
+  for what was verified). Optional: `GITHUB_TOKEN` in the environment (unauthenticated API access is rate-limited). For other hosts, see
   [Other hosts](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/commands.md#other-hosts).
 
 ## Install
