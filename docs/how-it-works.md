@@ -15,7 +15,7 @@ report. `build --repeat` checks a particular build: see [Commands](commands.md#b
 2. **Sequential build.** Tried PRs are merged with `git merge --no-ff` onto the base in the
    configured order (unlisted PRs follow by number). The test command runs after each merge.
    A conflict is aborted; a test failure is re-run once and the merge is reset. A failure that
-   passes on re-run is recorded as flaky.
+   passes on re-run is recorded as flaky, with the tests that failed on the first run.
 3. **Swap test.** A conflicting PR that does not merge onto the base by itself is listed as
    conflicting with the base and is not tested further: it needs a rebase, and no other PR is the
    cause. For each other conflicting PR, the merged PRs it conflicts with pairwise
