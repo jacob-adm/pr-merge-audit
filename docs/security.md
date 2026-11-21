@@ -44,5 +44,8 @@ What the tool does to limit damage short of that:
 - The work directory is only ever deleted if it holds the `.audit-workspace` marker the tool
   wrote there.
 - `GITHUB_TOKEN` is sent only to the configured API host and is not passed on by redirects.
+- Setup, test and probe commands run without network unless the config says `"network":
+  "allowed"`: code from a PR cannot connect out or resolve names. Localhost still works. See
+  [Configuration](configuration.md) for how, and where it is not possible.
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).

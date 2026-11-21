@@ -68,6 +68,8 @@ UNITTEST = {
     "count_pattern": r"^Ran (\d+) test",
     "skipped_pattern": r"skipped=(\d+)",
     "message_pattern": r"^\w*Error: (.+)$",
+    # Windows has no way to run commands without network short of administrator rights.
+    **({"network": "allowed"} if os.name == "nt" else {}),
 }
 # Runs a single probe module with unittest.
 PROBE_CMD = ["{python}", "-m", "unittest", "{module}"]
@@ -1487,6 +1489,59 @@ class RateLimit(unittest.TestCase):
         msg = str(stop.exception.code)
         for part in ("HTTP 403", "rate limit reached", "1970-01-01 00:00 UTC", "GITHUB_TOKEN"):
             self.assertIn(part, msg)
+
+
+class Network(unittest.TestCase):
+    """Commands after the snapshot run without network unless the config allows it."""
+
+    def test_allowed_runs_commands_as_they_are(self):
+        """With network: allowed nothing is wrapped and the record says the network was allowed."""
+        self.assertEqual(audit.no_network({"network": "allowed"}), ([], {"blocked": False, "how": ""}))
+
+    def test_unknown_setting_is_refused(self):
+        """Only "blocked" and "allowed" are accepted."""
+        with self.assertRaises(SystemExit) as ctx:
+            audit.no_network({"network": "off"})
+        self.assertIn("network must be", str(ctx.exception))
+
+    @unittest.skipIf(os.name == "nt", "Windows has no unprivileged way to block the network")
+    def test_blocked_command_reaches_no_address_or_name_but_localhost(self):
+        """Inside the prefix: no route out, no name lookups, and localhost still works."""
+        prefix, network = audit.no_network({})
+        self.assertTrue(network["blocked"])
+        run = lambda code: subprocess.run(prefix + [sys.executable, "-c", code]).returncode
+        self.assertEqual(run(audit.NO_ROUTE_CHECK), 0)
+        self.assertEqual(run("import socket\ntry:\n    socket.gethostbyname('example.com')\n"
+                             "except OSError:\n    raise SystemExit(0)\nraise SystemExit(1)\n"), 0)
+        self.assertEqual(run("import socket\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen()\n"
+                             "socket.create_connection(s.getsockname()).close()\n"), 0)
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_windows_stops_unless_allowed(self):
+        """On Windows the build stops before running anything and names the setting."""
+        with self.assertRaises(SystemExit) as ctx:
+            audit.no_network({})
+        self.assertIn('"network": "allowed"', str(ctx.exception))
+
+    @unittest.skipIf(os.name == "nt", "Windows has no unprivileged way to block the network")
+    def test_build_runs_its_commands_without_network(self):
+        """A setup command that fails whenever an outside address is reachable lets a real build pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg, snap, bundle = make_project(tmp)
+            cfg = dict(cfg, setup_cmd=["{python}", "-c", audit.NO_ROUTE_CHECK])
+            res = build(cfg, snap, bundle, tmp, "net")
+            self.assertTrue(res["network"]["blocked"])
+            self.assertEqual(res["base_tests"]["outcome"], "pass")
+
+    def test_report_states_the_network(self):
+        """The procedure says whether the network was blocked, and how."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        res["network"] = {"blocked": True, "how": "macOS sandbox-exec"}
+        self.assertIn("- **Network:** blocked for every setup, test and probe command (macOS sandbox-exec).",
+                      audit.render({}, res))
+        res["network"] = {"blocked": False, "how": ""}
+        self.assertIn("- **Network:** allowed for setup, test and probe commands", audit.render({}, res))
 
 
 class Golden(unittest.TestCase):

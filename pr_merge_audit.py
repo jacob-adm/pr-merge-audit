@@ -76,6 +76,44 @@ OUTPUT_CAP = 4 * 1024 * 1024
 # the network, nothing that carries credentials.
 PASS_ENV = ("PATH", "SYSTEMROOT", "PATHEXT", "COMSPEC", "SYSTEMDRIVE", "WINDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
+# Every command after the snapshot (setup, tests, probes) runs without network unless the config
+# says `"network": "allowed"`. macOS: a sandbox profile that refuses outbound connections except to
+# localhost, and the system name resolver, so neither connections nor name lookups leave the machine.
+MACOS_NO_NETWORK = ('(version 1)(allow default)'
+                    '(deny network-outbound (remote ip "*:*"))'
+                    '(allow network-outbound (remote ip "localhost:*"))'
+                    '(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))')
+# Linux: run the command in a new user and network namespace that holds only loopback, as the same
+# user, then exec it. Needs unprivileged user namespaces; exits 125 with the reason when refused.
+LINUX_NO_NETWORK = r"""
+import ctypes, fcntl, os, socket, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+if libc.unshare(0x10000000 | 0x40000000) != 0:  # CLONE_NEWUSER | CLONE_NEWNET
+    sys.stderr.write("unshare: %s\n" % os.strerror(ctypes.get_errno()))
+    sys.exit(125)
+for name, text in (("setgroups", "deny"), ("uid_map", "%d %d 1" % (uid, uid)),
+                   ("gid_map", "%d %d 1" % (gid, gid))):
+    with open("/proc/self/" + name, "w") as f:
+        f.write(text)
+s = socket.socket()
+flags = struct.unpack("16sH14x", fcntl.ioctl(s, 0x8913, struct.pack("16sH14x", b"lo", 0)))[1]
+fcntl.ioctl(s, 0x8914, struct.pack("16sH14x", b"lo", flags | 1))  # loopback up, so localhost works
+s.close()
+os.execvp(sys.argv[1], sys.argv[1:])
+"""
+# Exits 0 when no outside address can be reached (IPv4 or IPv6 documentation addresses: a UDP
+# connect only looks up a route and sends nothing), 1 when one can.
+NO_ROUTE_CHECK = """
+import socket, sys
+for family, addr in ((socket.AF_INET, ("192.0.2.1", 9)), (socket.AF_INET6, ("2001:db8::1", 9))):
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.connect(addr)
+    except OSError:
+        continue
+    sys.exit(1)
+"""
 
 
 def load_config(path, merge_only=False):
@@ -750,6 +788,8 @@ class Workspace:
         # Each run gets its own process group (POSIX) or job object (Windows), so the whole process
         # tree can be stopped when the run ends or times out.
         posix = hasattr(os, "killpg")
+        # Without network unless the config allows it (see no_network); the prefix execs `argv`.
+        argv = list(self.cfg.get("_net_prefix", [])) + list(argv)
         with open(log, "wb") as f:
             proc = subprocess.Popen(argv, cwd=root, env=env, stdout=f, stderr=subprocess.STDOUT,
                                     start_new_session=posix)
@@ -1136,6 +1176,38 @@ def write_branch(gitdir, ref, tip):
     git(gitdir, "update-ref", "--no-deref", "-m", "pr-merge-audit build", ref, tip, "", env=caller_env())
 
 
+def no_network(cfg):
+    """Return (argv prefix, network record) for running commands after the snapshot.
+
+    With `"network": "allowed"` commands run as they are. Otherwise they must run without network:
+    an environment with no route to any outside address already is; on macOS a sandbox profile and
+    on Linux a network namespace make it so. Where neither works, or on another system, the build
+    stops here, before anything has run, naming the reason and the setting that allows the network.
+    """
+    setting = cfg.get("network", "blocked")
+    if setting not in ("blocked", "allowed"):
+        sys.exit('config: network must be "blocked" (the default) or "allowed"')
+    if setting == "allowed":
+        return [], {"blocked": False, "how": ""}
+    hint = 'set "network": "allowed" in the config to run them with network'
+    # Already offline, for example a container started without a network.
+    if subprocess.run([sys.executable, "-c", NO_ROUTE_CHECK]).returncode == 0:
+        return [], {"blocked": True, "how": "no route to any outside address"}
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        prefix, how = [shutil.which("sandbox-exec"), "-p", MACOS_NO_NETWORK], "macOS sandbox-exec"
+    elif sys.platform.startswith("linux"):
+        prefix, how = [sys.executable, "-c", LINUX_NO_NETWORK], "Linux network namespace"
+    else:
+        sys.exit(f"cannot run setup, test and probe commands without network on {sys.platform}; {hint}")
+    # Prove it before any work: the check must find no route from inside.
+    check = subprocess.run(prefix + [sys.executable, "-c", NO_ROUTE_CHECK],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if check.returncode != 0:
+        reason = check.stdout.strip() or "an outside address is still reachable"
+        sys.exit(f"cannot run setup, test and probe commands without network ({how}: {reason}); {hint}")
+    return prefix, {"blocked": True, "how": how}
+
+
 def cmd_build(cfg, args):
     """`build` command: merge-test the snapshot offline and write the results file.
 
@@ -1155,6 +1227,12 @@ def cmd_build(cfg, args):
     print("note: merge-only, no code from any PR is run" if merge_only else
           "note: this runs code from every PR it tries; use a disposable machine without credentials",
           file=sys.stderr)
+    # Commands after the snapshot run without network unless the config allows it; stop now if
+    # that cannot be arranged. A merge-only build runs no commands.
+    network = None
+    if not merge_only:
+        cfg = dict(cfg)
+        cfg["_net_prefix"], network = no_network(cfg)
     # Every deviation from the default rules is recorded and shown at the top of the report.
     overrides = []
     if merge_only:
@@ -1246,6 +1324,7 @@ def cmd_build(cfg, args):
         "base_tests": base_result,
         "final_tests": final,
         "merge_only": merge_only,
+        "network": network,
         "order": seq,
         "not_tried": not_tried,
         "steps": steps,
@@ -1351,6 +1430,12 @@ def render(cfg, res):
     w(f"- **Base:** `{snap['base_ref']}` at `{snap['base_sha'][:7]}`, with PR heads fetched on {snap['date']}.")
     py = f"Python {tools['python']}, " if tools.get("python") else ""
     w(f"- **Environment:** {py}git {tools['git']}, {tools['os']}.")
+    network = res.get("network")
+    if network and network.get("blocked"):
+        w(f"- **Network:** blocked for every setup, test and probe command ({network['how']}).")
+    elif network:
+        w("- **Network:** allowed for setup, test and probe commands (`network: allowed` in the config); "
+          "their results may depend on what the network returned.")
     skipped = res["final_tests"].get("skipped", 0)
     note = f" {skipped} tests were skipped in the final run." if skipped else ""
     merge_only = res.get("merge_only")
