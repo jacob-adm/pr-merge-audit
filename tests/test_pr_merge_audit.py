@@ -1595,6 +1595,57 @@ class Network(unittest.TestCase):
         self.assertIn("- **Network:** allowed for setup, test and probe commands", audit.render({}, res))
 
 
+class SnapshotWithoutTests(unittest.TestCase):
+    """A merge-only first run: snapshot works from a configuration that has no test command."""
+
+    def test_snapshot_needs_no_test_command(self):
+        """snapshot runs without test_cmd; a normal build of its output is still refused."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # A remote with a main branch and one pull request ref, as a forge serves them.
+        remote = tmp / "remote"
+        remote.mkdir()
+        sh(remote, "git", "init", "-q", "-b", "main")
+        commit(remote, {"a.txt": "a\n"}, "base")
+        head = branch(remote, "pr1", {"b.txt": "b\n"})
+        sh(remote, "git", "update-ref", "refs/pull/1/head", head)
+
+        class Pulls(http.server.BaseHTTPRequestHandler):
+            """Stand-in for the REST API: one open pull request against main."""
+            def do_GET(self):
+                """Answer the open pull request listing."""
+                body = [{"number": 1, "title": "one", "draft": False, "base": {"ref": "main"}}]
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode())
+
+            def log_message(self, *a):
+                """Keep test output free of request logs."""
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Pulls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config = tmp / "config.json"
+        config.write_text(json.dumps({"repo": "local/test", "remote": str(remote), "base": "main",
+                                      "api": f"http://127.0.0.1:{server.server_port}"}))
+        env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+
+        def cli(*argv):
+            """Run the command line in `tmp` and return the finished process."""
+            return subprocess.run([sys.executable, str(ROOT / "pr_merge_audit.py"), "--config", str(config), *argv],
+                                  cwd=tmp, env=env, capture_output=True, text=True)
+
+        snap = cli("snapshot", "--date", "d")
+        self.assertEqual(snap.returncode, 0, snap.stderr)
+        prs = json.loads((tmp / "snapshots" / "d.json").read_text())["prs"]
+        self.assertEqual([(p["number"], p["head"]) for p in prs], [(1, head)])
+        tested = cli("build", "--snapshot", "snapshots/d.json")
+        self.assertNotEqual(tested.returncode, 0)
+        self.assertIn("test_cmd is required (or run build with --merge-only)", tested.stderr)
+
+
 class Golden(unittest.TestCase):
     """Results of a build of the fixture in make_project, and the report they render to."""
 
