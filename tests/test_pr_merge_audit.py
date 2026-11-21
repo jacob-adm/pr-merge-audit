@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Import the module from the repository root, so the tests run against the working copy.
 ROOT = Path(__file__).resolve().parent.parent
@@ -535,6 +536,64 @@ class SmallBuilds(unittest.TestCase):
         self.assertIn("\n#1\n", text)
         self.assertNotIn("Swap test did not pass", text)
         self.assertNotIn("Text conflicts", text)
+
+    def merge_only_project(self):
+        """Two PRs, neither with a passing test: #1 has no tests at all, #2's test always fails."""
+        repo = self.tmp / "src"
+        repo.mkdir()
+        sh(repo, "git", "init", "-q", "-b", "main")
+        base = commit(repo, {"app.py": "X = 1\n"}, "base")
+        failing = "import unittest\nclass T(unittest.TestCase):\n    def test_p2(self): self.fail('would fail')\n"
+        heads = {1: branch(repo, "p1", {"one.py": "A = 1\n"}),
+                 2: branch(repo, "p2", {"two.py": "B = 1\n", "tests/test_p2.py": failing})}
+        sh(repo, "git", "update-ref", "refs/audit/base", base)
+        for n, head in heads.items():
+            sh(repo, "git", "update-ref", f"refs/audit/pr/{n}", head)
+        bundle = self.tmp / "snap.bundle"
+        sh(repo, "git", "bundle", "create", "-q", str(bundle), "--glob=refs/audit")
+        snap = self.tmp / "snap.json"
+        files = {1: ["one.py"], 2: ["two.py", "tests/test_p2.py"]}
+        snap.write_text(json.dumps({
+            "date": "test", "repo": "local/test", "base_ref": "main", "base_sha": base,
+            "prs": [{"number": n, "title": f"p{n}", "head": heads[n], "draft": False, "status": "SUCCESS",
+                     "files": files[n]} for n in (1, 2)]}))
+        config = self.tmp / "config.json"
+        config.write_text(json.dumps({"repo": "local/test", "base": "main", "workers": 1,
+                                      "probes": [{"name": "p", "file": "probe.py", "cmd": ["false"], "targets": ["base"]}]}))
+        return config, snap, bundle
+
+    def test_merge_only_runs_nothing_and_tries_every_pr(self):
+        """--merge-only needs no test_cmd, tries PRs without tests, and runs no test, setup or probe."""
+        config, snap, bundle = self.merge_only_project()
+        cfg = audit.load_config(str(config), merge_only=True)
+        with mock.patch.object(audit.Workspace, "execute", side_effect=AssertionError("code was run")), \
+                mock.patch.object(audit.Workspace, "export", side_effect=AssertionError("files were exported")):
+            res = build(cfg, snap, bundle, self.tmp, "a")
+        self.assertEqual((res["merged"], res["not_tried"], res["merge_only"]), ([1, 2], [], True))
+        text = audit.render(cfg, res)
+        self.assertIn("**Override:** merge-only run: no tests were run and no code from any PR was executed; "
+                      "1 configured probe(s) not run.", text)
+        self.assertIn("### Result: 2 of 2 PRs merged together without a text conflict (no tests run)", text)
+        self.assertIn("- **Test run:** none.", text)
+        self.assertNotIn("every test passing", text)
+        self.assertNotIn("Test-suite runs", text)
+        self.assertNotIn("Serial landing", text)
+        self.assertIn("It doesn't show the PRs work together", text)
+
+    def test_without_merge_only_the_same_project_needs_a_test_command(self):
+        """The same configuration is refused for a normal build, and names the option."""
+        config, snap, bundle = self.merge_only_project()
+        with self.assertRaises(SystemExit) as stop:
+            audit.load_config(str(config))
+        self.assertIn("test_cmd is required (or run build with --merge-only)", str(stop.exception))
+
+    def test_merge_only_cannot_emit_a_branch(self):
+        """An untested build is never written to a branch."""
+        config, snap, bundle = self.merge_only_project()
+        cfg = audit.load_config(str(config), merge_only=True)
+        with self.assertRaises(SystemExit) as stop:
+            build(cfg, snap, bundle, self.tmp, "a", emit_branch="refs/heads/integration", emit_repo=self.tmp / "src")
+        self.assertIn("cannot be combined with --merge-only", str(stop.exception))
 
     def test_ignore_status_is_applied_and_shown(self):
         """--ignore-status tries failing-status PRs and says so in the report."""

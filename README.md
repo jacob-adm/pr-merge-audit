@@ -54,6 +54,7 @@ pr-merge-audit --config CONFIG snapshot                        freeze PR heads a
 pr-merge-audit --config CONFIG build --snapshot FILE           merge-test offline, write results
       [--emit-branch REF --emit-repo PATH]                     also keep the merged build as a branch
       [--ignore-status] [--out FILE]
+      [--merge-only]                                           only merge: no tests, no PR code run
 pr-merge-audit report --results FILE [--out FILE]              render the Markdown report
 pr-merge-audit verify --results FILE [--golden FILE]           check the report renders the same
 pr-merge-audit --config CONFIG estimate --snapshot FILE --reference FILE   rough running time here
@@ -72,6 +73,9 @@ pr-merge-audit --config config.json snapshot
 pr-merge-audit --config config.json build --snapshot snapshots/DATE.json
 pr-merge-audit report --results results/DATE.json --out reports/DATE.md
 ```
+
+To see only which PRs conflict, without running any PR's code, add `--merge-only` to `build`. It
+needs no `test_cmd` and tries every open PR, so it is a safe first run on a repository.
 
 `DATE` is the UTC date of the snapshot. Paths are relative to the current directory, so keep
 each project's config, snapshots and results in a directory of its own.

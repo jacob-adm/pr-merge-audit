@@ -5,6 +5,10 @@ whatever the filters decided about them; `estimate` runs the base's tests. That 
 with access to everything your user can reach. **Run builds on a disposable machine or
 container that holds no credentials, keys or tokens.** Nothing in this tool is a sandbox.
 
+`build --merge-only` is the exception: it runs no tests, setup command or probes and never copies
+a PR's files out of git, so no code from any PR is executed. It still runs git on the fetched
+commits, with the protections listed below.
+
 Because a PR's code runs inside the test runner, a PR written to fake a pass can do so. A pass
 needs exit status 0 and, when `count_pattern` is set, at least one test counted. That catches an
 early exit or an empty run, but not output crafted to look like a real one.
