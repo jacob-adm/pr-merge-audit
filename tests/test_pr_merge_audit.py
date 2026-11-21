@@ -1655,6 +1655,42 @@ class Golden(unittest.TestCase):
         res = json.loads((GOLDEN / "results.json").read_text())
         self.assertEqual(audit.render({}, res), (GOLDEN / "report.md").read_text())
 
+    def run_report(self, *extra):
+        """Run `report` on the golden results as a subprocess; return the completed process."""
+        return subprocess.run([sys.executable, str(ROOT / "pr_merge_audit.py"), "report",
+                               "--results", str(GOLDEN / "results.json"), *extra],
+                              capture_output=True, text=True)
+
+    def test_golden_json(self):
+        """report --json prints the reviewed golden findings; without it, the golden Markdown."""
+        out = self.run_report("--json")
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertEqual(out.stdout, (GOLDEN / "report.json").read_text())
+        md = self.run_report()
+        self.assertEqual(md.stdout, (GOLDEN / "report.md").read_text())
+
+    def test_json_holds_every_pr_and_probe_once(self):
+        """Each PR tried or not tried is one record, and each probe is one record."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        rows = audit.findings(res)
+        prs = [r["pr"] for r in rows if r["kind"] == "pr"]
+        self.assertEqual(sorted(prs), sorted(res["order"] + [t["pr"] for t in res["not_tried"]]))
+        self.assertEqual(len([r for r in rows if r["kind"] == "probe"]), len(res["probes"]))
+        # The report's findings, as the golden Markdown states them.
+        by_pr = {r["pr"]: r for r in rows if r["kind"] == "pr"}
+        self.assertEqual((by_pr[2]["result"], by_pr[2]["with"]), ("conflict", [1]))
+        self.assertEqual((by_pr[4]["with"], by_pr[4]["failures"]), ([3], ["test_helper"]))
+        self.assertEqual(by_pr[9]["on_base"], "fail")
+        self.assertEqual([n for n, r in sorted(by_pr.items()) if r["merged"]], res["merged"])
+
+    def test_json_to_out_file(self):
+        """report --json --out FILE writes the JSON to FILE and nothing to stdout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "findings.json"
+            out = self.run_report("--json", "--out", str(target))
+            self.assertEqual((out.returncode, out.stdout), (0, ""))
+            self.assertEqual(target.read_text(), (GOLDEN / "report.json").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

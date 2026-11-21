@@ -6,6 +6,7 @@ python3 pr_merge_audit.py --config PROJECT/config.json build --snapshot snapshot
 python3 pr_merge_audit.py --config PROJECT/config.json build --snapshot snapshots/DATE.json \
     --emit-branch refs/heads/integration --emit-repo PATH/TO/CLONE   # also keep the merged build as a branch
 python3 pr_merge_audit.py report --results results/DATE.json --out reports/DATE.md
+python3 pr_merge_audit.py report --results results/DATE.json --json   # the findings as JSON
 python3 pr_merge_audit.py verify --results results/DATE.json --golden reports/DATE.md
 python3 pr_merge_audit.py --config PROJECT/config.json estimate --snapshot snapshots/DATE.json \
     --reference results/EARLIER.json                     # rough running time on this machine
@@ -121,6 +122,28 @@ If no PR merged, the branch is the base itself.
 ## report
 
 `report` renders a results file as a Markdown report, to `--out` or to standard output.
+
+With `--json` it writes the report's findings instead, as one JSON array of objects, for a CI step
+or an agent. The Markdown report without `--json` is unchanged. There is one object per PR (those
+tried, in build order, then those not tried) and one per probe:
+
+| Key | PR records (`"kind": "pr"`) |
+| --- | --- |
+| `pr` | The PR number |
+| `result` | `merged`, `conflict`, the test outcome that held the PR back (such as `fail` or `flaky`), or `not_tried` |
+| `merged` | `true` if the PR is in the merged set |
+| `with` | For a conflict, the PRs it conflicts with; for a failure, the confirmed culprit PR |
+| `files` | Conflicting files |
+| `failures` | Failing tests |
+| `swap` | The outcome of testing the PR swapped in, if it was; `base_conflict` when it does not merge onto the base alone |
+| `on_base` | The PR's result on the base alone, where the culprit search ran it |
+| `detail` | The test message, or for a PR not tried, the detail |
+| `reason` | For a PR not tried, why |
+
+Probe records (`"kind": "probe"`) have `probe`, `target`, `result` and `detail`. Every value comes
+from the results file as it is. The exit status is the same as without `--json`; to fail a CI step
+on a finding, check `result` and `merged`. [tests/golden/report.json](../tests/golden/report.json)
+is the JSON for the reviewed golden results.
 
 ## verify
 
