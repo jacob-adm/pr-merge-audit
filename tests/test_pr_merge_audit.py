@@ -584,6 +584,17 @@ class SmallBuilds(unittest.TestCase):
         self.assertNotIn("Serial landing", text)
         self.assertIn("It doesn't show the PRs work together", text)
 
+    def test_merge_only_procedure_describes_no_test_step(self):
+        """The Procedure of a merge-only report names only the steps that ran: no test, retry or culprit search."""
+        config, snap, bundle = self.merge_only_project()
+        cfg = audit.load_config(str(config), merge_only=True)
+        procedure = audit.render(cfg, build(cfg, snap, bundle, self.tmp, "a")).split("</details>")[0]
+        for step in ("If tests fail after a merge", "tests are run again", "Culprit search", "not tested further"):
+            self.assertNotIn(step, procedure)
+        self.assertIn("- **Swap test:** for each other conflicting PR, the merged PR(s) it conflicts with on its own "
+                      "(`git merge-tree`) are reverted and it is merged in their place.", procedure)
+        self.assertIn("is listed as conflicting with the base and is not compared with the other PRs.", procedure)
+
     def test_without_merge_only_the_same_project_needs_a_test_command(self):
         """The same configuration is refused for a normal build, and names the option."""
         config, snap, bundle = self.merge_only_project()
