@@ -1,8 +1,10 @@
 # How it works
 
 `snapshot` freezes the open PRs; `build` then works offline on that snapshot. No AI or network is
-involved after the snapshot step: the same snapshot, configuration and machine always produce the
-same report.
+involved after the snapshot step: the same snapshot, configuration and machine produce the same
+report, provided the project's own tests give the same result on every run. The tool cannot make
+a test suite deterministic; tests that depend on randomness, timing or the clock can change the
+report. `build --repeat` checks a particular build: see [Commands](commands.md#build).
 
 ## Procedure
 
