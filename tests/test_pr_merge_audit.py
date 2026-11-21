@@ -703,7 +703,7 @@ class SmallBuilds(unittest.TestCase):
 
 
     def test_flaky_pr_gets_no_culprit_search_and_one_label(self):
-        """A flaky PR gets no culprit search and is listed once, as flaky."""
+        """A flaky PR gets no culprit search and is listed once, as flaky, naming the tests that failed first."""
         marker = self.tmp / "ran-once"
         flaky = ("import os, unittest\nclass T(unittest.TestCase):\n    def test_p1(self):\n"
                  f"        if not os.path.exists({str(marker)!r}):\n"
@@ -711,8 +711,9 @@ class SmallBuilds(unittest.TestCase):
         cfg, snap, bundle = small_project(self.tmp, PASSING, "SUCCESS", pr_test=flaky)
         res = build(cfg, snap, bundle, self.tmp, "a")
         self.assertEqual((res["steps"][0]["outcome"], res["culprits"], res["test_runs"]["culprit"]), ("flaky", {}, 0))
+        self.assertEqual(res["steps"][0]["failures"], ["test_p1"])
         text = audit.render(cfg, res)
-        self.assertIn("**Flaky (failed, then passed on re-run):** #1.", text)
+        self.assertIn("**Flaky (failed, then passed on re-run):** #1 (`test_p1`).", text)
         self.assertNotIn("no single culprit", text)
 
     def test_repeat_records_a_reproduced_report(self):

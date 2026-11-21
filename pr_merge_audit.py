@@ -860,7 +860,8 @@ class Workspace:
     def test(self, wt, argv=None):
         """Run the tests, re-running once on failure.
 
-        A pass on the re-run is reported as `flaky`; two failures report the first run's result.
+        A pass on the re-run is reported as `flaky`, with the first run's failures; two failures
+        report the first run's result.
         """
         # Merge-only: a merge that succeeds is the whole test; nothing is exported or run.
         if self.cfg.get("merge_only"):
@@ -873,7 +874,7 @@ class Workspace:
         # Failed once: re-run to tell a flaky suite from a real failure.
         second = self.test_once(wt, argv)
         if second["outcome"] == "pass":
-            return dict(second, outcome="flaky")
+            return dict(second, outcome="flaky", failures=first.get("failures", []))
         return first
 
 
@@ -1506,7 +1507,9 @@ def render(cfg, res):
     w("")
     # Warn if the base itself is unreliable.
     if res["base_tests"]["outcome"] == "flaky":
-        w("**Warning:** the tests on the base are flaky (failed, then passed on re-run).")
+        failed = res["base_tests"].get("failures")
+        w("**Warning:** the tests on the base are flaky (failed, then passed on re-run)"
+          + (f": {code(failed)}." if failed else "."))
         w("")
     elif res["base_tests"]["outcome"] != "pass":
         w(f"**Warning:** the tests do not pass on the base itself ({code(res['base_tests'].get('failures', []))}).")
@@ -1615,7 +1618,8 @@ def render(cfg, res):
         elif c and not c.get("culprit"):
             other.append(f"- **Fails only in the full build, no single culprit found:** #{n} ({code(st.get('failures', []))}).")
         if st.get("outcome") == "flaky":
-            other.append(f"- **Flaky (failed, then passed on re-run):** #{n}.")
+            failed = f" ({code(st['failures'])})" if st.get("failures") else ""
+            other.append(f"- **Flaky (failed, then passed on re-run):** #{n}{failed}.")
     # Section: everything else worth a reader's attention.
     if other:
         w("### Other")
