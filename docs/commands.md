@@ -24,8 +24,14 @@ draft flag, required-status state) and `snapshots/DATE.bundle` (every commit inv
 build can be re-run later even after PR branches move or are deleted.
 
 It is the only GitHub-specific step and the only one that uses the network. It needs GitHub
-(github.com, or GitHub Enterprise through `api`). Optional: `GITHUB_TOKEN` in the environment
-(unauthenticated API access is rate-limited).
+(github.com, or GitHub Enterprise Server with `api` set to `https://HOST/api/v3`). Optional:
+`GITHUB_TOKEN` in the environment (unauthenticated API access is rate-limited).
+
+`snapshot` has run against github.com. It has not run against a live Enterprise Server: the three
+endpoints it calls, with every query parameter and response field it uses, were checked against
+GitHub's published REST API descriptions for Enterprise Server 3.19 to 3.22. They are listing open
+pull requests, the combined commit status and the check runs for a commit. PR heads are fetched
+from `refs/pull/N/head` with git, which Enterprise Server also provides.
 
 ### Private repositories
 
