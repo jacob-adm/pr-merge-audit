@@ -13,6 +13,10 @@ project.
 - Python 3.9 or later, standard library only.
 - git 2.38 or later (`git merge-tree --write-tree`).
 - Linux, macOS or Windows.
+- Setup, test and probe commands run without network by default. That works on macOS, on Linux
+  where unprivileged user namespaces are allowed, and on a machine or container with no network;
+  elsewhere, including Windows, set `"network": "allowed"`. See
+  [Configuration](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/configuration.md).
 - For `snapshot` only: GitHub (github.com, or GitHub Enterprise). Optional: `GITHUB_TOKEN` in
   the environment (unauthenticated API access is rate-limited). For other hosts, see
   [Other hosts](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/commands.md#other-hosts).

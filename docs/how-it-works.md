@@ -34,6 +34,12 @@ and tests run with a fixed locale, time zone and hash seed, a private `HOME` and
 none of the caller's environment variables other than `PATH` (plus proxy and certificate settings)
 and those listed in `pass_env`.
 
+Setup, test and probe commands also run without network, so nothing they fetch can change a
+result: on macOS in a sandbox, on Linux in a network namespace that holds only loopback, or as
+they are on a machine with no network. Localhost still works. Where none of these is possible the
+build stops before running anything. With `"network": "allowed"` in the config they reach the
+network, and the report says so. See [Configuration](configuration.md).
+
 ## Isolation
 
 Each test run gets a private home and temp directory, and the tool stops every process the run
