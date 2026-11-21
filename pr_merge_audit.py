@@ -117,11 +117,12 @@ for family, addr in ((socket.AF_INET, ("192.0.2.1", 9)), (socket.AF_INET6, ("200
 """
 
 
-def load_config(path, merge_only=False):
+def load_config(path, merge_only=False, runs_tests=True):
     """Read and validate the project configuration, then fill in defaults.
 
     Exits with a message on invalid input, so a misconfiguration fails before any work starts.
     With `merge_only`, nothing is run: no test command is needed and probes are dropped.
+    With `runs_tests` false (snapshot), a missing test command is allowed; one that is given is checked.
     """
     # Parse the JSON configuration file.
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -130,10 +131,10 @@ def load_config(path, merge_only=False):
         cfg["_probes_dropped"] = len(cfg.get("probes", []))
         cfg.update(test_cmd=["(none)"], probes=[])
         cfg.pop("setup_cmd", None)
-    # The test command is the only mandatory setting.
-    if not cfg.get("test_cmd"):
+    # The test command is the only mandatory setting, for the commands that run tests.
+    if not cfg.get("test_cmd") and runs_tests:
         sys.exit(f"{path}: test_cmd is required (or run build with --merge-only)")
-    if not argv_list(cfg["test_cmd"]):
+    if "test_cmd" in cfg and not argv_list(cfg["test_cmd"]):
         sys.exit(f"{path}: test_cmd must be a non-empty list of string arguments")
     # Every probe must say how to run it.
     for probe in cfg.get("probes", []):
@@ -1816,7 +1817,8 @@ def main():
     args = ap.parse_args()
     # report and verify read only a results file, so they need no project config.
     merge_only = getattr(args, "merge_only", False)
-    cfg = load_config(args.config, merge_only) if args.cmd in ("snapshot", "build", "estimate") else {}
+    cfg = (load_config(args.config, merge_only, runs_tests=args.cmd != "snapshot")
+           if args.cmd in ("snapshot", "build", "estimate") else {})
     {"snapshot": cmd_snapshot, "build": cmd_build, "report": cmd_report, "verify": cmd_verify, "estimate": cmd_estimate}[args.cmd](cfg, args)
 
 

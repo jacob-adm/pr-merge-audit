@@ -8,7 +8,7 @@ file kept with that project, not here. `config.example.json` is a starting point
 |---|---|
 | `repo`, `remote`, `api`, `base` | Repository, fetch URL, API root, base branch |
 | `required_status` | Status or check name a PR must pass to be tried (empty: none) |
-| `test_cmd` | Required, except for `build --merge-only`. Test command as a list of arguments; `{python}` is replaced |
+| `test_cmd` | Required by `build` and `estimate`; `snapshot` and `build --merge-only` do not need it. Test command as a list of arguments; `{python}` is replaced |
 | `test_prefix`, `test_timeout` | Test directory (default `tests/`), seconds per run (default 1800) |
 | `failure_pattern` | Regex whose group 1 is a failing test's name in the output (unset: none named) |
 | `count_pattern` | Regex whose group 1 is the number of tests run (unset: exit status alone decides) |
