@@ -1,0 +1,143 @@
+[
+  {
+    "detail": "",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": true,
+    "on_base": "",
+    "pr": 1,
+    "reason": "",
+    "result": "merged",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "",
+    "failures": [],
+    "files": [
+      "app.py"
+    ],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "",
+    "pr": 2,
+    "reason": "",
+    "result": "conflict",
+    "swap": "pass",
+    "with": [
+      1
+    ]
+  },
+  {
+    "detail": "",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": true,
+    "on_base": "",
+    "pr": 3,
+    "reason": "",
+    "result": "merged",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "module 'util' has no attribute 'helper'",
+    "failures": [
+      "test_helper"
+    ],
+    "files": [],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "pass",
+    "pr": 4,
+    "reason": "",
+    "result": "fail",
+    "swap": "",
+    "with": [
+      3
+    ]
+  },
+  {
+    "detail": "",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": true,
+    "on_base": "",
+    "pr": 5,
+    "reason": "",
+    "result": "merged",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "-1 != 3",
+    "failures": [
+      "test_add"
+    ],
+    "files": [],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "fail",
+    "pr": 9,
+    "reason": "",
+    "result": "fail",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "excluded for the test",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "",
+    "pr": 6,
+    "reason": "excluded",
+    "result": "not_tried",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "failure",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "",
+    "pr": 7,
+    "reason": "status",
+    "result": "not_tried",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "",
+    "failures": [],
+    "files": [],
+    "kind": "pr",
+    "merged": false,
+    "on_base": "",
+    "pr": 8,
+    "reason": "no_tests",
+    "result": "not_tried",
+    "swap": "",
+    "with": []
+  },
+  {
+    "detail": "",
+    "kind": "probe",
+    "probe": "helper exists",
+    "result": "pass",
+    "target": "base"
+  },
+  {
+    "detail": "False is not true",
+    "kind": "probe",
+    "probe": "helper exists",
+    "result": "fail",
+    "target": 3
+  }
+]

@@ -62,7 +62,7 @@ pr-merge-audit --config CONFIG build --snapshot FILE           merge-test offlin
       [--ignore-status] [--out FILE]
       [--merge-only]                                           only merge: no tests, no PR code run
       [--repeat]                                               build twice, fail if the reports differ
-pr-merge-audit report --results FILE [--out FILE]              render the Markdown report
+pr-merge-audit report --results FILE [--out FILE] [--json]     render the Markdown report, or JSON
 pr-merge-audit verify --results FILE [--golden FILE]           check the report renders the same
 pr-merge-audit --config CONFIG estimate --snapshot FILE --reference FILE   rough running time here
 ```

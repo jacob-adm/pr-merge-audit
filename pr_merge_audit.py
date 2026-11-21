@@ -1700,11 +1700,44 @@ def render(cfg, res):
     return "\n".join(L) + "\n"
 
 
+def findings(res):
+    """The report's findings as flat records: one per PR, in build order then not tried, then
+    one per probe. Each value comes from the results file as it is."""
+    steps = {s["pr"]: s for s in res.get("steps", [])}
+    swaps, culprits = res.get("swaps", {}), res.get("culprits", {})
+    merged = set(res.get("merged", []))
+    rows = []
+    for n in res.get("order", []):
+        st, sw, c = steps.get(n, {}), swaps.get(str(n), {}), culprits.get(str(n), {})
+        # The PRs this one conflicts with, or the confirmed culprit its tests fail with.
+        if st.get("outcome") == "conflict":
+            others = sw.get("blockers", [])
+        else:
+            others = [c["culprit"]] if confirmed(c) else []
+        rows.append({"kind": "pr", "pr": n, "result": st.get("outcome", ""), "merged": n in merged,
+                     "with": others, "files": st.get("files", []),
+                     "failures": st.get("failures", []), "swap": sw.get("outcome", ""),
+                     "on_base": c.get("on_base", ""), "detail": st.get("message", ""),
+                     "reason": ""})
+    for t in res.get("not_tried", []):
+        rows.append({"kind": "pr", "pr": t["pr"], "result": "not_tried", "merged": False,
+                     "with": [], "files": [], "failures": [], "swap": "", "on_base": "",
+                     "detail": t.get("detail", ""), "reason": t.get("reason", "")})
+    for p in res.get("probes", []):
+        rows.append({"kind": "probe", "probe": p["probe"], "target": p["target"],
+                     "result": p["outcome"], "detail": p.get("message", "")})
+    return rows
+
+
 def cmd_report(cfg, args):
-    """`report` command: render a results file to Markdown (stdout or `--out`)."""
+    """`report` command: render a results file to Markdown, or to JSON with `--json`
+    (stdout or `--out`)."""
     res = json.loads(Path(args.results).read_text(encoding="utf-8"))
     # Render, then write to a file or standard output.
-    text = render(cfg, res)
+    if args.json:
+        text = json.dumps(findings(res), indent=2, sort_keys=True) + "\n"
+    else:
+        text = render(cfg, res)
     if args.out:
         write_text(Path(args.out), text)
     else:
@@ -1810,6 +1843,7 @@ def main():
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)
     r.add_argument("--out")
+    r.add_argument("--json", action="store_true")
     # verify: check the report is stable and matches a golden copy.
     v = sub.add_parser("verify")
     v.add_argument("--results", required=True)
