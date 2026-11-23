@@ -12,10 +12,19 @@ license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = []
 classifiers = [
-    "Programming Language :: Python :: 3",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Testing",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jacob-adm/pr-merge-audit"
+Documentation = "https://github.com/jacob-adm/pr-merge-audit/tree/main/docs"
+Source = "https://github.com/jacob-adm/pr-merge-audit"
+Issues = "https://github.com/jacob-adm/pr-merge-audit/issues"
 
 [project.scripts]
 pr-merge-audit = "pr_merge_audit:main"
