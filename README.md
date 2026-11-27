@@ -15,7 +15,7 @@ The report for a demo repository with four open pull requests: #1 adds a functio
 file, #2 and #3 change the same line of another file, and #4 renames a function #1 calls.
 Rendered as GitHub shows it in a comment, with the Procedure section collapsed:
 
-![pr-merge-audit report: 2 of 4 PRs merge with every test passing, #3 conflicts with #2, #1 and #4 merge cleanly but fail test_subtract together](https://raw.githubusercontent.com/jacob-adm/pr-merge-audit/main/docs/screenshots/pr-merge-audit-report.png)
+<p align="center"><img src="https://raw.githubusercontent.com/jacob-adm/pr-merge-audit/main/docs/screenshots/pr-merge-audit-report.png" alt="pr-merge-audit report: 2 of 4 PRs merge with every test passing, #3 conflicts with #2, #1 and #4 merge cleanly but fail test_subtract together"></p>
 
 ## Requirements
 
