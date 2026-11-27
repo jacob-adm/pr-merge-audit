@@ -9,6 +9,14 @@ run. `build --repeat` checks that by building twice and failing if the two repor
 runner; everything about the repository under test is in a configuration file kept with that
 project.
 
+## Example output
+
+The report for a demo repository with four open pull requests: #1 adds a function in a new
+file, #2 and #3 change the same line of another file, and #4 renames a function #1 calls.
+Rendered as GitHub shows it in a comment, with the Procedure section collapsed:
+
+![pr-merge-audit report: 2 of 4 PRs merge with every test passing, #3 conflicts with #2, #1 and #4 merge cleanly but fail test_subtract together](https://raw.githubusercontent.com/jacob-adm/pr-merge-audit/main/docs/screenshots/pr-merge-audit-report.png)
+
 ## Requirements
 
 - Python 3.9 or later, standard library only.
