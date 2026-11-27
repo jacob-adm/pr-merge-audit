@@ -98,6 +98,7 @@ each project's config, snapshots and results in a directory of its own.
 
 ## Documentation
 
+- [For coding agents](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/AGENTS.md): how an agent runs pr-merge-audit, reads `--audit-json` and cites the evidence.
 - [How it works](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/how-it-works.md): each step of the build, and what makes it deterministic.
 - [Commands](https://github.com/jacob-adm/pr-merge-audit/blob/main/docs/commands.md): each command, snapshots from other hosts, and keeping
   the merged build as a branch.
