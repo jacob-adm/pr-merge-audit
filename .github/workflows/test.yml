@@ -27,3 +27,23 @@ jobs:
       - run: |
           python -m pip install .
           pr-merge-audit --help
+
+  # The package PyPI would receive: built, checked, and tested from the unpacked sdist.
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      # The sdist carries the suite; it must pass from the unpacked archive too.
+      - name: Tests pass from the unpacked sdist
+        run: |
+          mkdir sdist
+          tar -xzf dist/*.tar.gz -C sdist --strip-components=1
+          cd sdist && python -m unittest discover -s tests -v
