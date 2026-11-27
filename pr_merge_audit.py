@@ -1639,14 +1639,7 @@ def render(cfg, res):
         w("")
 
     # PRs not tried, grouped by reason, in a fixed order.
-    labels = [
-        ("excluded", "Excluded"),
-        ("status", f"Required status check not successful"),
-        ("draft", "Draft"),
-        ("duplicate", "Same change as another open PR"),
-        ("feature", "Feature, left for separate review"),
-        ("no_tests", "Changes code without tests"),
-    ]
+    labels = NOT_TRIED_LABELS
     # Section: PRs not tried, by reason.
     if res["not_tried"]:
         w(f"### Not tried ({len(res['not_tried'])} of {res['open_prs']} open PRs)")
@@ -1700,6 +1693,17 @@ def render(cfg, res):
     return "\n".join(L) + "\n"
 
 
+# Why a PR was not tried, in the report's order and words.
+NOT_TRIED_LABELS = [
+    ("excluded", "Excluded"),
+    ("status", "Required status check not successful"),
+    ("draft", "Draft"),
+    ("duplicate", "Same change as another open PR"),
+    ("feature", "Feature, left for separate review"),
+    ("no_tests", "Changes code without tests"),
+]
+
+
 def findings(res):
     """The report's findings as flat records: one per PR, in build order then not tried, then
     one per probe. Each value comes from the results file as it is."""
@@ -1729,9 +1733,99 @@ def findings(res):
     return rows
 
 
+# --audit-json: the same records as --json, each as a finding of format audit-result/1.
+AUDIT_FORMAT = "audit-result/1"
+
+
+def _numbers(prs):
+    """`#1`, `#1 and #2`, `#1, #2 and #3`."""
+    names = ["#%s" % n for n in prs]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def audit_finding(row, res):
+    """One --json record as an audit finding: a rule and severity fixed by the record's kind
+    and result, one sentence, and the base the build ran on as evidence."""
+    result = row["result"]
+    slug = "".join(ch if ch.isalnum() else "-" for ch in result.lower()).strip("-") or "unknown"
+    if row["kind"] == "probe":
+        where = "the base" if row["target"] == "base" else "PR #%s" % row["target"]
+        verb = {"pass": "passes", "fail": "fails"}.get(result, "gives " + result)
+        text = "Probe '%s' %s on %s" % (row["probe"], verb, where)
+        if row.get("detail"):
+            text += ": " + " ".join(str(row["detail"]).split())
+        severity = "info" if result == "pass" else "high"
+    else:
+        pr = "PR #%s" % row["pr"]
+        if result == "merged":
+            text = pr + (" merges" if res.get("merge_only") else " merges and the tests pass")
+            severity = "info"
+        elif result == "not_tried":
+            label = dict(NOT_TRIED_LABELS).get(row["reason"], row["reason"] or "no reason given")
+            text = "%s was not tried: %s" % (pr, label[0].lower() + label[1:])
+            if row.get("detail"):
+                text += " (%s)" % " ".join(str(row["detail"]).split())
+            severity = "info"
+        elif result == "conflict":
+            text = "%s conflicts" % pr
+            text += " with %s" % _numbers(row["with"]) if row["with"] else " with the PRs before it"
+            text += " in %s" % ", ".join(row["files"]) if row["files"] else ""
+            if row["swap"] == "base_conflict":
+                text += "; it does not merge onto the base alone either"
+            elif row["swap"]:
+                instead = " in place of " + _numbers(row["with"]) if row["with"] else " instead"
+                if row["swap"] == "pass" and res.get("merge_only"):
+                    # A merge-only build runs no tests: a pass there only means it merged.
+                    text += ";%s it merges cleanly" % instead
+                elif row["swap"] == "pass":
+                    text += "; merged%s, the tests pass" % instead
+                else:
+                    text += "; merged%s, the tests give: %s" % (instead, row["swap"])
+            severity = "medium"
+        else:
+            # Any test outcome that held the PR back (fail, error, flaky, ...).
+            text = "%s %s" % (pr, {"fail": "fails", "flaky": "is flaky in"}.get(
+                result, "gives %s in" % result))
+            text += " " + ", ".join(row["failures"]) if row["failures"] else " its tests"
+            if row["with"]:
+                text += " when merged with %s" % _numbers(row["with"])
+            if row["on_base"] == "fail":
+                text += ", and also on the base alone"
+            elif row["on_base"] == "pass":
+                text += ", but passes on the base alone"
+            if row.get("detail"):
+                text += ": " + " ".join(str(row["detail"]).split())
+            severity = "medium" if result == "flaky" else "high"
+    snap = res.get("snapshot", {})
+    evidence = {}
+    if snap.get("base_ref"):
+        evidence["ref"] = snap["base_ref"]
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(snap.get("base_sha", ""))):
+        evidence["commit"] = snap["base_sha"]
+    if row["kind"] == "pr" and len(row["files"]) == 1:
+        evidence["path"] = row["files"][0]
+    return {"rule": "pr-merge-audit.%s.%s" % (row["kind"], slug), "severity": severity,
+            "message": text, "evidence": evidence or {"ref": "results"}, "record": row}
+
+
+def audit_result(res, errors=()):
+    """The audit result object for a results file (or, with ERRORS, for one that failed)."""
+    found = [audit_finding(r, res) for r in findings(res)] if not errors else []
+    snap = res.get("snapshot", {})
+    target = {"kind": "repository", "name": str(snap.get("repo") or "-")}
+    if snap.get("base_ref"):
+        target["base"] = str(snap["base_ref"])
+    code = 2 if errors else (1 if any(f["severity"] != "info" for f in found) else 0)
+    return {"format": AUDIT_FORMAT, "tool": {"name": "pr-merge-audit", "version": __version__},
+            "target": target, "exit": code, "findings": found,
+            "errors": [{"message": m} for m in errors]}
+
+
 def cmd_report(cfg, args):
     """`report` command: render a results file to Markdown, or to JSON with `--json`
     (stdout or `--out`)."""
+    if args.audit_json:
+        return report_audit(args)
     res = json.loads(Path(args.results).read_text(encoding="utf-8"))
     # Render, then write to a file or standard output.
     if args.json:
@@ -1742,6 +1836,27 @@ def cmd_report(cfg, args):
         write_text(Path(args.out), text)
     else:
         sys.stdout.write(text)
+
+
+def report_audit(args):
+    """`report --audit-json`: one audit result object; exit 1 if a finding is above info, 2 if
+    the results file cannot be read. The object is written in every case."""
+    errors, res = [], {}
+    try:
+        res = json.loads(Path(args.results).read_text(encoding="utf-8"))
+        if not isinstance(res, dict):
+            raise ValueError("not a results object")
+        doc = audit_result(res)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        errors.append("cannot read results file %s: %s" % (args.results, exc))
+        sys.stderr.write("pr-merge-audit: %s\n" % errors[0])
+        doc = audit_result({}, errors)
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    if args.out:
+        write_text(Path(args.out), text)
+    else:
+        sys.stdout.write(text)
+    sys.exit(doc["exit"])
 
 
 def cmd_verify(cfg, args):
@@ -1808,13 +1923,28 @@ def serial_landing(n, one):
             f"at a time (each landing waits for its run)"]
 
 
+class _Parser(argparse.ArgumentParser):
+    """With `report --audit-json`, a usage error is still written as one audit result object."""
+
+    def error(self, message):
+        """Report a usage error: as the object with --audit-json, else as argparse does."""
+        argv = sys.argv[1:]
+        if "--audit-json" in (argv[:argv.index("--")] if "--" in argv else argv):
+            self.print_usage(sys.stderr)
+            sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+            doc = audit_result({}, [message])
+            sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+            sys.exit(2)
+        argparse.ArgumentParser.error(self, message)
+
+
 def main():
     """Command-line entry point: parse arguments and dispatch to the sub-command."""
     for stream in (sys.stdout, sys.stderr):  # a PR title the console's code page lacks must not crash
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
     # Command-line interface: a global --config and one sub-command per phase.
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = _Parser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="config.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
     # snapshot: freeze PR metadata and commits (network).
@@ -1843,7 +1973,11 @@ def main():
     r = sub.add_parser("report")
     r.add_argument("--results", required=True)
     r.add_argument("--out")
-    r.add_argument("--json", action="store_true")
+    form = r.add_mutually_exclusive_group()
+    form.add_argument("--json", action="store_true")
+    form.add_argument("--audit-json", action="store_true",
+                      help="one audit result object (format audit-result/1); exit 1 if a PR or "
+                           "probe failed or conflicted, 2 if the results file cannot be read")
     # verify: check the report is stable and matches a golden copy.
     v = sub.add_parser("verify")
     v.add_argument("--results", required=True)
