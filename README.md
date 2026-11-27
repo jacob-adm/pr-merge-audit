@@ -1,5 +1,7 @@
 # pr-merge-audit
 
+[![Test](https://github.com/jacob-adm/pr-merge-audit/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/jacob-adm/pr-merge-audit/actions/workflows/test.yml) [![PyPI](https://img.shields.io/pypi/v/pr-merge-audit?style=flat-square&color=0F6378&label=PyPI)](https://pypi.org/project/pr-merge-audit/) [![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https://raw.githubusercontent.com/jacob-adm/pr-merge-audit/main/pyproject.toml&style=flat-square&color=0F6378&label=python)](https://github.com/jacob-adm/pr-merge-audit/blob/main/pyproject.toml) [![Licence](https://img.shields.io/pypi/l/pr-merge-audit?style=flat-square&color=0F6378&label=licence)](https://github.com/jacob-adm/pr-merge-audit#license)
+
 Merge-tests the open pull requests of a repository against its base branch and writes a
 Markdown report of which PRs combine cleanly, which conflict, and which break each other's tests.
 
