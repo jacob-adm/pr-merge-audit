@@ -1692,5 +1692,129 @@ class Golden(unittest.TestCase):
             self.assertEqual(target.read_text(), (GOLDEN / "report.json").read_text())
 
 
+
+class AuditJson(unittest.TestCase):
+    """report --audit-json: the --json records as one audit result object (audit-result/1)."""
+
+    def run_report(self, results, *extra):
+        """Run `report --audit-json` on RESULTS as a subprocess; return (process, object)."""
+        out = subprocess.run([sys.executable, str(ROOT / "pr_merge_audit.py"), "report",
+                              "--audit-json", "--results", str(results), *extra],
+                             capture_output=True, text=True)
+        doc = json.loads(out.stdout) if out.stdout else None
+        if doc is not None:
+            # The rules of the format a report can break.
+            self.assertEqual(set(doc), {"format", "tool", "target", "exit", "findings", "errors"})
+            self.assertEqual(doc["tool"], {"name": "pr-merge-audit", "version": audit.__version__})
+            for f in doc["findings"]:
+                self.assertEqual(set(f), {"rule", "severity", "message", "evidence", "record"})
+                self.assertRegex(f["rule"], r"\Apr-merge-audit\.(pr|probe)\.[a-z0-9-]+\Z")
+                self.assertTrue(f["evidence"])
+            found = any(f["severity"] != "info" for f in doc["findings"])
+            self.assertEqual(doc["exit"], 2 if doc["errors"] else 1 if found else 0)
+            self.assertEqual(out.returncode, doc["exit"])
+        return out, doc
+
+    def write_results(self, tmp, res):
+        """Write RES as a results file in TMP; return its path."""
+        path = Path(tmp) / "results.json"
+        path.write_text(json.dumps(res))
+        return path
+
+    def test_golden(self):
+        """The golden results give the reviewed object; its records are report --json's."""
+        out, doc = self.run_report(GOLDEN / "results.json")
+        self.assertEqual(out.stderr, "")
+        golden = json.loads((GOLDEN / "report.audit.json").read_text())
+        # The golden copy shows the version it was reviewed with; the rest must match exactly.
+        golden["tool"]["version"] = doc["tool"]["version"]
+        self.assertEqual(doc, golden)
+        self.assertEqual([f["record"] for f in doc["findings"]],
+                         json.loads((GOLDEN / "report.json").read_text()))
+        self.assertEqual(doc["target"], {"kind": "repository", "name": "local/test",
+                                         "base": "main"})
+
+    def test_messages_and_severities(self):
+        """Merged and not tried are info; a conflict is medium; a failure and a probe fail high."""
+        _, doc = self.run_report(GOLDEN / "results.json")
+        got = {(f["rule"], f["severity"], f["message"]) for f in doc["findings"]}
+        for want in [
+            ("pr-merge-audit.pr.merged", "info", "PR #1 merges and the tests pass"),
+            ("pr-merge-audit.pr.conflict", "medium",
+             "PR #2 conflicts with #1 in app.py; merged in place of #1, the tests pass"),
+            ("pr-merge-audit.pr.fail", "high",
+             "PR #4 fails test_helper when merged with #3, but passes on the base alone: "
+             "module 'util' has no attribute 'helper'"),
+            ("pr-merge-audit.pr.fail", "high",
+             "PR #9 fails test_add, and also on the base alone: -1 != 3"),
+            ("pr-merge-audit.pr.not-tried", "info",
+             "PR #8 was not tried: changes code without tests"),
+            ("pr-merge-audit.probe.fail", "high",
+             "Probe 'helper exists' fails on PR #3: False is not true")]:
+            self.assertIn(want, got)
+        # Every finding points at the base the build ran on.
+        base = json.loads((GOLDEN / "results.json").read_text())["snapshot"]["base_sha"]
+        self.assertTrue(all(f["evidence"]["commit"] == base for f in doc["findings"]))
+        conflict = [f for f in doc["findings"] if f["rule"] == "pr-merge-audit.pr.conflict"][0]
+        self.assertEqual(conflict["evidence"]["path"], "app.py")
+
+    def test_only_merged_prs_exit_0(self):
+        """A build in which every PR tried merged, with passing probes, exits 0."""
+        res = json.loads((GOLDEN / "results.json").read_text())
+        res["order"], res["not_tried"] = res["merged"], []
+        res["probes"] = [p for p in res["probes"] if p["outcome"] == "pass"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out, doc = self.run_report(self.write_results(tmp, res))
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual({f["severity"] for f in doc["findings"]}, {"info"})
+
+    def test_other_outcomes(self):
+        """Flaky is medium; a base conflict and a merge-only build read as such."""
+        row = {"kind": "pr", "pr": 7, "result": "flaky", "merged": False, "with": [],
+               "files": [], "failures": ["test_x"], "swap": "", "on_base": "", "detail": "",
+               "reason": ""}
+        f = audit.audit_finding(row, {})
+        self.assertEqual((f["severity"], f["message"]), ("medium", "PR #7 is flaky in test_x"))
+        self.assertEqual(f["evidence"], {"ref": "results"})
+        row = dict(row, result="conflict", files=["a.py", "b.py"], swap="base_conflict")
+        f = audit.audit_finding(row, {})
+        self.assertEqual(f["message"], "PR #7 conflicts with the PRs before it in a.py, b.py; it "
+                                       "does not merge onto the base alone either")
+        self.assertNotIn("path", f["evidence"])
+        row = dict(row, result="merged", files=[], swap="")
+        self.assertEqual(audit.audit_finding(row, {"merge_only": True})["message"], "PR #7 merges")
+        # A merge-only build runs no tests, so a swap that merges does not say the tests pass.
+        row = dict(row, result="conflict", files=["a.py"], swap="pass", **{"with": [3]})
+        self.assertEqual(audit.audit_finding(row, {"merge_only": True})["message"],
+                         "PR #7 conflicts with #3 in a.py; in place of #3 it merges cleanly")
+
+    def test_unreadable_results_still_write_the_object(self):
+        """A missing or malformed results file is the object's one error, exit 2."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in (None, "[1, 2]", "not json"):
+                path = Path(tmp) / "results.json"
+                if content is not None:
+                    path.write_text(content)
+                with self.subTest(content):
+                    out, doc = self.run_report(path)
+                    self.assertEqual((out.returncode, doc["findings"]), (2, []))
+                    self.assertTrue(doc["errors"][0]["message"].startswith("cannot read results"))
+                    self.assertIn("cannot read results", out.stderr)
+
+    def test_usage_error_writes_the_object(self):
+        """--json with --audit-json is a usage error, still written as one object."""
+        out, doc = self.run_report(GOLDEN / "results.json", "--json")
+        self.assertIn("not allowed with argument", doc["errors"][0]["message"])
+        self.assertIn("usage:", out.stderr)
+
+    def test_out_file(self):
+        """--out FILE gets the object, and the exit status is the same."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "audit.json"
+            out, _ = self.run_report(GOLDEN / "results.json", "--out", str(target))
+            self.assertEqual((out.returncode, out.stdout), (1, ""))
+            self.assertEqual(json.loads(target.read_text())["exit"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

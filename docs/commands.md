@@ -145,6 +145,52 @@ from the results file as it is. The exit status is the same as without `--json`;
 on a finding, check `result` and `merged`. [tests/golden/report.json](../tests/golden/report.json)
 is the JSON for the reviewed golden results.
 
+With `--audit-json` it writes one JSON object in the audit result format (`audit-result/1`)
+instead, for a CI job or an agent that runs several audit tools and reads their results the same
+way. Each `--json` record becomes a finding with a rule id, a severity, one sentence and its
+evidence, and is kept unchanged under `record`.
+[tests/golden/report.audit.json](../tests/golden/report.audit.json) is the object for the golden
+results; one of its findings:
+
+```json
+{
+  "evidence": {
+    "commit": "0a40f3570a38064f98d562625355f614f0148f59",
+    "ref": "main"
+  },
+  "message": "PR #4 fails test_helper when merged with #3, but passes on the base alone: module 'util' has no attribute 'helper'",
+  "record": { "kind": "pr", "pr": 4, "result": "fail", "with": [3], "...": "..." },
+  "rule": "pr-merge-audit.pr.fail",
+  "severity": "high"
+}
+```
+
+| Key | Value |
+| --- | --- |
+| `target` | `kind` `repository`; `name`, the snapshot's `repo`; `base`, its `base_ref`. |
+| `exit` | 0, 1 or 2, as below. |
+| `findings` | One object per `--json` record, in the same order. |
+| `errors` | The reason the results file could not be read, or the usage error. |
+
+| Record | `rule` | `severity` |
+| --- | --- | --- |
+| PR merged | `pr-merge-audit.pr.merged` | `info` |
+| PR not tried | `pr-merge-audit.pr.not-tried` | `info` (the message gives the reason in the report's words) |
+| PR conflicts | `pr-merge-audit.pr.conflict` | `medium`: the PR may still land after a rebase, and the message says how the swap test went |
+| PR flaky | `pr-merge-audit.pr.flaky` | `medium` |
+| PR fails (or another test outcome) | `pr-merge-audit.pr.OUTCOME`, for example `pr-merge-audit.pr.fail` | `high` |
+| Probe passes | `pr-merge-audit.probe.pass` | `info` |
+| Probe gives anything else | `pr-merge-audit.probe.OUTCOME` | `high` |
+
+`evidence` holds `ref` and `commit`, the base the build ran on, and `path` when the PR conflicts
+in exactly one file. A results file written by hand without a snapshot has no base, and the
+evidence is then `{"ref": "results"}`.
+
+Unlike the Markdown report and `--json`, which exit 0, `report --audit-json` exits like the other
+audit tools: 1 if any finding is above `info`, 0 if none, and 2 if the results file cannot be
+read or the arguments are wrong. The object is written in each case, to standard output or
+`--out`, and an error is also written to standard error.
+
 ## verify
 
 `verify` renders the report twice and checks that both renders are identical; with `--golden`,
