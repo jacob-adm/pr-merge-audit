@@ -9,6 +9,10 @@ run. `build --repeat` checks that by building twice and failing if the two repor
 runner; everything about the repository under test is in a configuration file kept with that
 project.
 
+It is one of six audit tools that print the same result format with `--audit-json`.
+[suite-gate](https://github.com/jacob-adm/suite-gate) runs them together and gives one verdict per
+branch, as a command, a GitHub Action or an MCP server for coding agents.
+
 ## Example output
 
 The report for a demo repository with four open pull requests: #1 adds a function in a new
