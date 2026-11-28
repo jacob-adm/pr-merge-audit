@@ -1,0 +1,40 @@
+{
+  "format": "gate-rules/1",
+  "name": "ci-warn-ci",
+  "version": 1,
+  "checks": [
+    {
+      "tool": "git-surface"
+    },
+    {
+      "tool": "trust-path",
+      "when_changed": [
+        "^\\.github/workflows/",
+        "^\\.gitea/workflows/",
+        "^\\.forgejo/workflows/"
+      ]
+    },
+    {
+      "tool": "release-drift",
+      "for_each_changed": [
+        "(^|/)(package-lock\\.json|npm-shrinkwrap\\.json|uv\\.lock|poetry\\.lock|requirements[^/]*\\.txt)$"
+      ]
+    },
+    {
+      "tool": "git-overlap",
+      "others": "refs/remotes/origin/"
+    }
+  ],
+  "verdict": {
+    "fail": [
+      "high"
+    ],
+    "warn": [
+      "medium",
+      "low"
+    ]
+  },
+  "warn_rules": [
+    "git-surface.ci"
+  ]
+}
