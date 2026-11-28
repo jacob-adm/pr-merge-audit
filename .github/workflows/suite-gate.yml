@@ -14,4 +14,4 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: jacob-adm/suite-gate@7d6a70e877cbd592a22974924538283b4e50fdc0 # v0.3.0
+      - uses: jacob-adm/suite-gate@7c2033a4f245323f3e0a8ba805b2c9146749fc39 # v0.3.1
