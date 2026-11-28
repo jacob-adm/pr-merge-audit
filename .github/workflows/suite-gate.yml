@@ -1,0 +1,17 @@
+# One verdict for each pull request from the audit tools: what it changes that runs or is
+# trusted, new paths from untrusted input in its workflows, what its lockfile upgrades pull in,
+# and which other open branches change the same files.
+name: suite-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jacob-adm/suite-gate@7d6a70e877cbd592a22974924538283b4e50fdc0 # v0.3.0
